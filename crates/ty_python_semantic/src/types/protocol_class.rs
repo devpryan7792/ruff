@@ -16,7 +16,7 @@ use crate::types::call::CallArguments;
 use crate::types::overrides::{VariableKind, effective_superclass_variable_kind};
 use crate::types::projection::{CallableSelfBinding, ObservationEdge, ObservedTypePair};
 use crate::types::recursive::RecursiveOperation;
-use crate::types::relation::{DisjointnessChecker, TypeRelationChecker};
+use crate::types::relation::{DisjointnessChecker, TypeRelation, TypeRelationChecker};
 use crate::types::visitor::any_over_type_expanding_aliases;
 use crate::types::{TypeContext, TypeNormalization, UpcastPolicy};
 use crate::{
@@ -3458,41 +3458,22 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 .when_some_and(db, self.constraints, |callables| {
                     callables.iter().when_all(db, self.constraints, |callable| {
                         if callable.is_function_like(db) {
-                            let operands = self.with_protocol_member_operands(
-                                db,
-                                ty,
-                                Type::Callable(*callable),
-                                Type::Callable(required_callable),
-                                member,
-                                required.mode,
-                            );
                             // Require a positional receiver before binding: a zero-argument static
                             // method otherwise loses no parameters while the protocol loses `self`.
                             let signatures = CallableSignature::from_overloads(
                                 callable
                                     .signatures(db)
                                     .iter()
-                                    .enumerate()
-                                    .filter(|(_, signature)| {
+                                    .filter(|signature| {
                                         let parameters = signature.parameters();
                                         parameters.get_positional(0).is_some()
                                             || parameters.variadic().is_some()
                                     })
-                                    .map(|(index, signature)| {
-                                        let observed = operands
-                                            .operands()
-                                            .source
-                                            .callable_overload(db, env, index)
-                                            .unwrap_or_else(|| {
-                                                operands.operands().source.unresolved()
-                                            });
-                                        signature.bind_self_with_receiver_in_context(
+                                    .map(|signature| {
+                                        signature.bind_self(
                                             db,
                                             env,
                                             Some(implementation_self_binding_ty),
-                                            Some(implementation_self_binding_ty),
-                                            &self.context(),
-                                            &observed,
                                         )
                                     }),
                             );
@@ -3500,14 +3481,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                                 return self.never();
                             }
                             let source = Type::Callable(callable.with_signatures(db, signatures));
-                            let target = Type::Callable(protocol_bind_self_in_context(
+                            let target = Type::Callable(protocol_bind_self(
                                 db,
                                 env.program(db),
                                 required_callable,
                                 Some(protocol_self_binding_ty),
                                 Some(protocol_self_binding_ty),
-                                &operands.operands().target,
-                                &self.context(),
                             ));
                             self.with_protocol_member_operands(
                                 db,
@@ -4070,7 +4049,10 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
             else {
                 return self.never();
             };
-            let Some(method_signatures) = callable_disjointness_signatures(db, method) else {
+            let receiver_checker = self.as_relation_checker(TypeRelation::Assignability);
+            let Some(method_signatures) =
+                callable_disjointness_signatures(db, &receiver_checker, method)
+            else {
                 return self.never();
             };
 
@@ -4085,7 +4067,8 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
             };
 
             callables.iter().when_all(db, self.constraints, |callable| {
-                let Some(callable_signatures) = callable_disjointness_signatures(db, *callable)
+                let Some(callable_signatures) =
+                    callable_disjointness_signatures(db, &receiver_checker, *callable)
                 else {
                     return self.never();
                 };
@@ -4258,8 +4241,9 @@ impl<'db> ProtocolMemberCandidate<'db> {
                     for parameter in signature.parameters().iter().skip(skip_receiver) {
                         visitor.visit_type(db, parameter.annotated_type());
                     }
-                    for ty in signature.receiver_constraint_types() {
-                        visitor.visit_type(db, ty);
+                    for (receiver, annotation) in signature.receiver_relations() {
+                        visitor.visit_type(db, receiver);
+                        visitor.visit_type(db, annotation);
                     }
                     visitor.visit_type(db, signature.return_ty);
                 }
@@ -4491,26 +4475,6 @@ fn protocol_bind_self<'db>(
     receiver_type: Option<Type<'db>>,
     self_type: Option<Type<'db>>,
 ) -> CallableType<'db> {
-    protocol_bind_self_in_context(
-        db,
-        program,
-        callable,
-        receiver_type,
-        self_type,
-        &super::projection::ObservedType::root(Type::Callable(callable)),
-        &super::relation::RelationContext::default(),
-    )
-}
-
-fn protocol_bind_self_in_context<'db>(
-    db: &'db dyn Db,
-    program: Program<'db>,
-    callable: CallableType<'db>,
-    receiver_type: Option<Type<'db>>,
-    self_type: Option<Type<'db>>,
-    observed: &super::projection::ObservedType<'db>,
-    context: &super::relation::RelationContext<'db>,
-) -> CallableType<'db> {
     if callable.is_dunder_paramspec(db) {
         return callable.into_regular(db);
     }
@@ -4519,21 +4483,9 @@ fn protocol_bind_self_in_context<'db>(
     callable
         .with_signatures(
             db,
-            CallableSignature::from_overloads(callable.signatures(db).iter().enumerate().map(
-                |(index, signature)| {
-                    let observed = observed
-                        .callable_overload(db, &env, index)
-                        .unwrap_or_else(|| observed.unresolved());
-                    signature.bind_self_with_receiver_in_context(
-                        db,
-                        &env,
-                        receiver_type,
-                        self_type,
-                        context,
-                        &observed,
-                    )
-                },
-            )),
+            callable
+                .signatures(db)
+                .bind_self_with_receiver(db, &env, receiver_type, self_type),
         )
         .into_regular(db)
 }
@@ -4544,7 +4496,7 @@ fn protocol_bind_self_in_context<'db>(
     cycle_initial=|db, _, _, _, _, _| CallableType::bottom(db),
     heap_size=ruff_memory_usage::heap_size
 )]
-pub(super) fn protocol_apply_self_with_receiver<'db>(
+fn protocol_apply_self_with_receiver<'db>(
     db: &'db dyn Db,
     program: Program<'db>,
     callable: CallableType<'db>,
@@ -4560,19 +4512,26 @@ pub(super) fn protocol_apply_self_with_receiver<'db>(
 ///
 /// Return-type disjointness is a pragmatic approximation for method members: a callable returning
 /// `Never` could satisfy otherwise-incompatible signatures, so it must not establish disjointness.
+/// An impossible receiver removes an overload; uncertain applicability cannot prove disjointness.
 fn callable_disjointness_signatures<'db>(
     db: &'db dyn Db,
+    checker: &TypeRelationChecker<'_, '_, 'db>,
     callable: CallableType<'db>,
 ) -> Option<SmallVec<[(usize, &'db Signature<'db>); 1]>> {
-    let signatures = callable.signatures(db);
-    if signatures.overloads.is_empty()
-        || signatures
-            .iter()
-            .any(|signature| signature.return_ty.resolve_type_alias(db).is_never())
-    {
-        return None;
+    let mut available = SmallVec::new();
+    for (index, signature) in callable.signatures(db).iter().enumerate() {
+        let receiver = signature.receiver_constraints_when_satisfied(db, checker);
+        if receiver.is_never_satisfied(db, checker.env, checker.inferable) {
+            continue;
+        }
+        if !receiver.is_always_satisfied(db, checker.env, checker.inferable)
+            || signature.return_ty.resolve_type_alias(db).is_never()
+        {
+            return None;
+        }
+        available.push((index, signature));
     }
-    Some(signatures.iter().enumerate().collect())
+    (!available.is_empty()).then_some(available)
 }
 
 /// Protocol compatibility can only succeed if every required member is present.

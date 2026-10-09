@@ -7,7 +7,6 @@ use rustc_hash::FxHashMap;
 
 use super::cyclic::TypeIdentity;
 use super::generics::{ApplySpecialization, Specialization};
-use super::protocol_class::protocol_apply_self_with_receiver;
 use super::recursive::RecursiveOperation;
 use super::relation::RelationContext;
 use super::tuple::{Tuple, TupleShapePosition, VariableSegment};
@@ -41,12 +40,28 @@ pub(super) enum ObservationEdge {
     ClassBase(usize),
     ClassMetaclassInstance,
     CallableOverload(usize),
-    CallableParameter { overload: usize, parameter: usize },
-    CallableReturn { overload: usize },
+    CallableParameter {
+        overload: usize,
+        parameter: usize,
+    },
+    CallableReturn {
+        overload: usize,
+    },
+    CallableReceiver {
+        overload: usize,
+        relation: usize,
+        annotation: bool,
+    },
     TypedDictField(Name),
     TypedDictExtraItems,
-    ProtocolMemberRead { name: Name, class_access: bool },
-    ProtocolMemberWrite { name: Name, class_access: bool },
+    ProtocolMemberRead {
+        name: Name,
+        class_access: bool,
+    },
+    ProtocolMemberWrite {
+        name: Name,
+        class_access: bool,
+    },
 }
 
 impl ObservationEdge {
@@ -382,7 +397,6 @@ impl<'db> ObservedType<'db> {
         env: &ProgramEnvironment<'db>,
     ) -> Vec<Self> {
         let mut edges = Vec::new();
-        let mut dependencies = Vec::new();
         match self.ty {
             Type::Union(union) => {
                 edges.extend((0..union.elements(db).len()).map(ObservationEdge::UnionElement));
@@ -439,11 +453,15 @@ impl<'db> ObservedType<'db> {
                         if !signature.is_paramspec_value() {
                             edges.push(ObservationEdge::CallableReturn { overload });
                         }
-                        dependencies.extend(
-                            signature
-                                .receiver_constraint_types()
-                                .map(|ty| Self::dependent_on(ty, std::slice::from_ref(self))),
-                        );
+                        for (relation, _) in signature.receiver_relation_slots() {
+                            for annotation in [false, true] {
+                                edges.push(ObservationEdge::CallableReceiver {
+                                    overload,
+                                    relation,
+                                    annotation,
+                                });
+                            }
+                        }
                     }
                 }
                 if let Type::FunctionLiteral(function) = self.ty
@@ -486,12 +504,10 @@ impl<'db> ObservedType<'db> {
                     .collect();
             }
         }
-        dependencies.extend(
-            edges
-                .into_iter()
-                .filter_map(|edge| self.project(db, env, edge)),
-        );
-        dependencies
+        edges
+            .into_iter()
+            .filter_map(|edge| self.project(db, env, edge))
+            .collect()
     }
 
     /// Select the occurrence of a declaring class in this operand's specialized MRO.
@@ -810,40 +826,12 @@ impl<'db> ObservedType<'db> {
         }
     }
 
-    fn permits_structural_replay(
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        ty: Type<'db>,
-    ) -> bool {
-        let mut pending = vec![ty];
-        let mut seen = rustc_hash::FxHashSet::default();
-        while let Some(ty) = pending.pop() {
-            if !seen.insert(ty) || matches!(ty, Type::RecursiveVar(_)) {
-                continue;
-            }
-            if ty.as_callable().is_some_and(|callable| {
-                callable
-                    .signatures(db)
-                    .iter()
-                    .any(|signature| signature.receiver_constraint_types().next().is_some())
-            }) {
-                return false;
-            }
-            pending.extend(shallow_stored_children(db, env, ty));
-        }
-        true
-    }
-
     fn instantiate_node(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         origin: &ObservedTypeOrigin<'db>,
         node: Type<'db>,
     ) -> Option<Type<'db>> {
-        // Eager receiver metadata requires a proof, so only the closed value can expose it.
-        if !Self::permits_structural_replay(db, env, node) {
-            return None;
-        }
         let contravariant = origin
             .node
             .path
@@ -877,15 +865,14 @@ impl<'db> ObservedType<'db> {
                     path_depth,
                 } => {
                     let edge = origin.node.path.get(*path_depth);
-                    let overload = match edge {
+                    let (overload, receiver) = match edge {
                         None => {
                             let Type::Callable(callable) = mapped else {
                                 return None;
                             };
-                            mapped = Type::Callable(protocol_apply_self_with_receiver(
+                            mapped = Type::Callable(callable.apply_self_with_receiver(
                                 db,
-                                env.program(db),
-                                callable,
+                                env,
                                 binding.receiver,
                                 binding.self_type,
                             ));
@@ -894,17 +881,19 @@ impl<'db> ObservedType<'db> {
                         Some(
                             ObservationEdge::CallableParameter { overload, .. }
                             | ObservationEdge::CallableReturn { overload },
-                        ) => *overload,
+                        ) => (*overload, false),
+                        Some(ObservationEdge::CallableReceiver { overload, .. }) => {
+                            (*overload, true)
+                        }
                         Some(ObservationEdge::CallableOverload(overload)) => {
                             match origin.node.path.get(*path_depth + 1) {
                                 None => {
                                     let Type::Callable(callable) = mapped else {
                                         return None;
                                     };
-                                    mapped = Type::Callable(protocol_apply_self_with_receiver(
+                                    mapped = Type::Callable(callable.apply_self_with_receiver(
                                         db,
-                                        env.program(db),
-                                        callable,
+                                        env,
                                         binding.receiver,
                                         binding.self_type,
                                     ));
@@ -913,14 +902,31 @@ impl<'db> ObservedType<'db> {
                                 Some(
                                     ObservationEdge::CallableParameter { .. }
                                     | ObservationEdge::CallableReturn { .. },
-                                ) => *overload,
+                                ) => (*overload, false),
+                                Some(ObservationEdge::CallableReceiver { .. }) => (*overload, true),
                                 _ => return None,
                             }
                         }
                         _ => return None,
                     };
                     let signature = callable.signatures(db).overloads.get(overload)?;
-                    // The visible parameter and return scopes receive lexical Self binding.
+                    // Runtime receiver substitution only acts on retained receiver obligations.
+                    // Parameters and returns receive the lexical Self substitution alone.
+                    if receiver {
+                        let mapping = TypeMapping::BindSelf(SelfBinding::new(
+                            db,
+                            env,
+                            binding.receiver,
+                            Some(BindingContext::Synthetic(env.program(db))),
+                        ));
+                        let visitor = ApplyTypeMappingVisitor::new_for_type_construction(env);
+                        mapped = mapped.apply_type_mapping_impl(
+                            db,
+                            &mapping,
+                            TypeContext::default(),
+                            &visitor,
+                        );
+                    }
                     let mapping = TypeMapping::BindSelf(SelfBinding::new(
                         db,
                         env,
@@ -1036,8 +1042,8 @@ impl<'db> ObservedType<'db> {
     }
 
     /// Bind a callable with the same domain-sensitive operation used by signature checking.
-    /// Keep its input signatures so later parameter and return edges replay the lexical Self
-    /// substitution that applied at their original signature position.
+    /// Keep its input signatures so later parameter, return, and receiver edges replay exactly
+    /// the substitutions that applied at their original signature position.
     pub(super) fn bind_callable_self(
         &self,
         db: &'db dyn Db,
@@ -1050,10 +1056,9 @@ impl<'db> ObservedType<'db> {
         let Type::Callable(callable) = self.ty else {
             return self.unresolved();
         };
-        let ty = Type::Callable(protocol_apply_self_with_receiver(
+        let ty = Type::Callable(callable.apply_self_with_receiver(
             db,
-            env.program(db),
-            callable,
+            env,
             binding.receiver,
             binding.self_type,
         ));
@@ -1543,7 +1548,8 @@ fn observation_child<'db>(
             _,
             ObservationEdge::CallableOverload(overload)
             | ObservationEdge::CallableReturn { overload }
-            | ObservationEdge::CallableParameter { overload, .. },
+            | ObservationEdge::CallableParameter { overload, .. }
+            | ObservationEdge::CallableReceiver { overload, .. },
         ) => {
             let signatures = match template {
                 Type::Callable(callable) => callable.signatures(db),
@@ -1563,6 +1569,13 @@ fn observation_child<'db>(
                     .parameters()
                     .get(*parameter)
                     .map(Parameter::annotated_type),
+                ObservationEdge::CallableReceiver {
+                    relation,
+                    annotation,
+                    ..
+                } => signature
+                    .receiver_relation_at(*relation)
+                    .map(|(receiver, expected)| if *annotation { expected } else { receiver }),
                 _ => None,
             }
         }
@@ -1705,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn callable_binding_preserves_visible_signature_types() {
+    fn callable_binding_preserves_receiver_and_parameter_domains() {
         let db = setup_db();
         let env = db.program_environment();
         let self_type = Type::TypeVar(BoundTypeVarInstance::synthetic_self(
@@ -1722,6 +1735,7 @@ mod tests {
             self_type,
         )
         .bind_self(&db, &env, None);
+        assert_eq!(signature.receiver_relations().count(), 1);
         let callable = CallableType::new(
             &db,
             CallableSignature::single(signature),
@@ -1757,6 +1771,14 @@ mod tests {
                 instance,
             ),
             (ObservationEdge::CallableReturn { overload: 0 }, instance),
+            (
+                ObservationEdge::CallableReceiver {
+                    overload: 0,
+                    relation: 0,
+                    annotation: false,
+                },
+                class,
+            ),
         ] {
             let child = bound.child_at(&db, &env, expected, edge);
             assert!(!child.is_unresolved());
@@ -1766,6 +1788,74 @@ mod tests {
                 Some(expected),
             );
         }
+    }
+
+    #[test]
+    fn discharging_a_receiver_keeps_later_expression_positions() {
+        let db = setup_db();
+        let env = db.program_environment();
+        let class = KnownClass::Int.to_class_literal(&db, &env);
+        let any_class = KnownClass::Type.to_instance(&db, &env);
+        let signature = Signature::new(
+            Parameters::standard([
+                Parameter::positional_only(None).with_annotated_type(class),
+                Parameter::positional_only(None).with_annotated_type(any_class),
+            ]),
+            Type::Never,
+        )
+        .bind_self(&db, &env, None)
+        .bind_self(&db, &env, None);
+        assert_eq!(signature.receiver_relations().count(), 2);
+        let callable = CallableType::new(
+            &db,
+            CallableSignature::single(signature),
+            CallableTypeKind::Regular,
+        );
+        let ty = Type::Callable(callable);
+        let observation = ObservedType {
+            ty,
+            origin: Some(Rc::new(ObservedTypeOrigin {
+                constructor: TypeIdentity::Other(ty),
+                application: ty,
+                node: ty.into(),
+                operations: Box::default(),
+            })),
+            shape: ObservedShape::Expression,
+        };
+        let bound = observation.bind_callable_self(
+            &db,
+            &env,
+            CallableSelfBinding {
+                receiver: class,
+                self_type: KnownClass::Int.to_instance(&db, &env),
+            },
+        );
+        let discharged = ObservationEdge::CallableReceiver {
+            overload: 0,
+            relation: 0,
+            annotation: true,
+        };
+        let surviving = ObservationEdge::CallableReceiver {
+            overload: 0,
+            relation: 1,
+            annotation: true,
+        };
+        assert_eq!(
+            super::observation_child(&db, &env, bound.ty, &discharged),
+            None
+        );
+        assert_eq!(
+            super::observation_child(&db, &env, bound.ty, &surviving),
+            Some(any_class)
+        );
+        let child = bound.child_at(&db, &env, any_class, surviving);
+        assert!(!child.is_unresolved());
+        let origin = child.origin().unwrap();
+        assert_eq!(origin.node.template, any_class);
+        assert_eq!(
+            ObservedType::instantiate_node(&db, &env, &origin, origin.node.template,),
+            Some(any_class),
+        );
     }
 
     #[test]
