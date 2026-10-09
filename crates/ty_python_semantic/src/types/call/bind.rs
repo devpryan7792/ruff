@@ -2009,7 +2009,9 @@ impl<'db> Bindings<'db> {
                     }
 
                     function @ Type::FunctionLiteral(function_type)
-                        if dataclass_field_specifiers.contains(&function) =>
+                        if dataclass_field_specifiers
+                            .iter()
+                            .any(|specifier| specifier.resolve_type_alias(db) == function) =>
                     {
                         // Helper to get the type of a keyword argument by name. We first try to get it from
                         // the parameter binding (for explicit parameters), and then fall back to checking the

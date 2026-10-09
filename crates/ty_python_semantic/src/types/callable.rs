@@ -66,39 +66,65 @@ impl<'db> Type<'db> {
         instance: Option<Type<'db>>,
         owner: Option<Type<'db>>,
     ) -> Option<Type<'db>> {
-        // ParamSpec specialization can produce a union of function descriptors.
-        match self {
-            Type::Union(union) => {
-                return union.try_map(db, env, |alternative| {
-                    alternative.function_like_dunder_get(db, env, instance, owner)
-                });
-            }
-            Type::TypeAlias(alias) => {
-                return alias
-                    .value_type(db)
-                    .function_like_dunder_get(db, env, instance, owner);
-            }
-            _ => {}
-        }
-        let kind = self.function_like_kind(db)?;
-        let receiver = match kind {
-            CallableTypeKind::StaticMethodLike => return Some(self.underlying_function(db)),
-            CallableTypeKind::ClassMethodLike => owner
-                .filter(|owner| !owner.is_none(db))
-                .or_else(|| instance.map(|instance| instance.to_meta_type(db, env))),
-            _ => instance,
-        };
-        Some(receiver.map_or_else(
-            || self.underlying_function(db),
-            |receiver| {
-                Type::BoundMethod(super::BoundMethodType::from_callable(
-                    db,
-                    self,
-                    env.program(db),
-                    receiver,
+        self.function_like_dunder_get_guarded(
+            db,
+            env,
+            instance,
+            owner,
+            &ActiveRecursionDetector::default(),
+        )
+    }
+
+    fn function_like_dunder_get_guarded(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        instance: Option<Type<'db>>,
+        owner: Option<Type<'db>>,
+        active: &ActiveRecursionDetector<Type<'db>>,
+    ) -> Option<Type<'db>> {
+        active.visit(
+            &self,
+            || None,
+            || {
+                // ParamSpec specialization can produce a union of function descriptors.
+                match self {
+                    Type::Union(union) => {
+                        return union.try_map(db, env, |alternative| {
+                            alternative
+                                .function_like_dunder_get_guarded(db, env, instance, owner, active)
+                        });
+                    }
+                    Type::TypeAlias(_) | Type::Recursive(_) => {
+                        return self
+                            .resolve_type_alias(db)
+                            .function_like_dunder_get_guarded(db, env, instance, owner, active);
+                    }
+                    _ => {}
+                }
+                let kind = self.function_like_kind(db)?;
+                let receiver = match kind {
+                    CallableTypeKind::StaticMethodLike => {
+                        return Some(self.underlying_function(db));
+                    }
+                    CallableTypeKind::ClassMethodLike => owner
+                        .filter(|owner| !owner.is_none(db))
+                        .or_else(|| instance.map(|instance| instance.to_meta_type(db, env))),
+                    _ => instance,
+                };
+                Some(receiver.map_or_else(
+                    || self.underlying_function(db),
+                    |receiver| {
+                        Type::BoundMethod(super::BoundMethodType::from_callable(
+                            db,
+                            self,
+                            env.program(db),
+                            receiver,
+                        ))
+                    },
                 ))
             },
-        ))
+        )
     }
 
     /// Create a callable type with a single non-overloaded signature.

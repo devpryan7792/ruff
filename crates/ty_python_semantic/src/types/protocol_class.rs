@@ -3332,7 +3332,7 @@ impl<'db> ProtocolMemberCandidate<'db> {
 
     fn is_bound_method_like(self, db: &'db dyn Db) -> bool {
         self.bound_on_class.is_yes()
-            && match self.ty {
+            && match self.ty.resolve_type_alias(db) {
                 Type::FunctionLiteral(_) => true,
                 Type::Callable(callable) => callable.is_method_like(db),
                 _ => false,
@@ -3344,7 +3344,7 @@ impl<'db> ProtocolMemberCandidate<'db> {
         db: &'db dyn Db,
         visitor: &V,
     ) {
-        match self.ty {
+        match self.ty.resolve_type_alias(db) {
             Type::PropertyInstance(property) => {
                 // A property exposes its getter return and setter value types. Walking the
                 // accessor callables themselves would also visit their receiver and make every
@@ -3486,7 +3486,7 @@ fn cached_protocol_interface<'db>(
             bound_on_class,
         } = candidate;
 
-        let member = match ty {
+        let member = match ty.resolve_type_alias(db) {
             Type::PropertyInstance(property) => ProtocolMemberData::property(
                 property
                     .getter(db)

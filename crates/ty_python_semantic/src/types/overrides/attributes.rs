@@ -77,12 +77,10 @@ fn attribute_contract<'db>(
     if matches!(class_place.ty, Type::TypeAlias(_)) {
         return None;
     }
-    let alternatives = class_place
-        .ty
+    let class_ty = class_place.ty.resolve_type_alias(db);
+    let alternatives = class_ty
         .as_union()
-        .map_or(std::slice::from_ref(&class_place.ty), |union| {
-            union.elements(db)
-        });
+        .map_or(std::slice::from_ref(&class_ty), |union| union.elements(db));
     // Only pairs of methods go to the method checker. A decorator can turn a
     // function into a property, in which case its exposed value must be checked.
     let is_method = alternatives.iter().all(|ty| {

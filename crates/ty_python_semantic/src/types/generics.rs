@@ -218,7 +218,7 @@ fn find_typevar_binding<'db>(
         {
             let definition = index.expect_single_definition(function);
             if let Some(function_ty) =
-                infer_definition_types(db, definition).function_type(definition)
+                infer_definition_types(db, definition).function_type(db, definition)
             {
                 let signature = function_ty
                     .last_definition_raw_signature(db, ReturnCallableTypeVarScope::Lexical);
@@ -395,7 +395,7 @@ impl<'db> GenericContext<'db> {
             NodeWithScopeKind::Function(function) => {
                 let definition = index.expect_single_definition(function);
                 infer_definition_types(db, definition)
-                    .function_type(definition)?
+                    .function_type(db, definition)?
                     .last_definition_signature(db)
                     .generic_context
             }
@@ -422,7 +422,7 @@ impl<'db> GenericContext<'db> {
         if let NodeWithScopeKind::Function(function) = node {
             let definition = index.expect_single_definition(function);
             infer_definition_types(db, definition)
-                .function_type(definition)?
+                .function_type(db, definition)?
                 .last_definition_raw_signature(db, ReturnCallableTypeVarScope::Lexical)
                 .generic_context
         } else {

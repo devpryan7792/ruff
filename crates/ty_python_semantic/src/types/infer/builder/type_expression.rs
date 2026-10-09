@@ -54,6 +54,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         definition: Option<Definition<'db>>,
     ) -> Option<(Type<'db>, Option<GenericContext<'db>>)> {
         let db = self.db();
+        let value_ty = value_ty.resolve_inferred_type(db);
         let mut definition = definition?;
         // A resolved non-recursive value already describes the alias. Gradual types, unions,
         // and quoted aliases can hide recursive references, so they still need inference.
@@ -1944,7 +1945,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             ctx: _,
         } = subscript;
 
-        match value_ty {
+        match value_ty.resolve_type_alias(db) {
             Type::Never => {
                 // This case can be entered when we use a type annotation like `Literal[1]`
                 // in unreachable code, since we infer `Never` for `Literal`.  We call

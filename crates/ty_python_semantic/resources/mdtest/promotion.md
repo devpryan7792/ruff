@@ -765,7 +765,7 @@ def _(x: tuple[Literal["hello"]]):
 type X = Literal["hello"]
 
 x4: X = "hello"
-reveal_type(x4)  # revealed: Literal["hello"]
+reveal_type(x4)  # revealed: X
 reveal_type([x4])  # revealed: list[X]
 
 class MyEnum(Enum):

@@ -1,6 +1,7 @@
 pub(crate) mod definitions;
 
 use crate::ProgramEnvironment;
+use crate::types::RecursiveCycle;
 use itertools::Either;
 use ruff_index::IndexSlice;
 use ruff_python_ast::PythonVersion;
@@ -15,9 +16,9 @@ use crate::reachability::{
     evaluate_reachability_with_cache,
 };
 use crate::types::{
-    DynamicType, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers, TypeQualifiers,
-    UnionBuilder, UnionType, binding_type, inferred_declaration, is_discarded_dict_key_assignment,
-    may_exist_at_runtime,
+    DynamicType, KnownClass, MemberLookupPolicy, RecursiveType, Type, TypeAndQualifiers,
+    TypeQualifiers, UnionBuilder, UnionType, binding_type, inferred_declaration,
+    is_discarded_dict_key_assignment, may_exist_at_runtime,
 };
 use crate::{Db, FxIndexSet, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
@@ -1261,16 +1262,95 @@ impl<'db> From<Place<'db>> for PlaceAndQualifiers<'db> {
     }
 }
 
+/// Look up a public place type, retaining a stable reference while its query is cyclic.
+pub(crate) fn place_by_id<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    place_id: ScopedPlaceId,
+    requires_explicit_reexport: RequiresExplicitReExport,
+    considered_definitions: ConsideredDefinitions,
+) -> PlaceAndQualifiers<'db> {
+    let (place, cycle) = place_by_id_impl(
+        db,
+        scope,
+        place_id,
+        requires_explicit_reexport,
+        considered_definitions,
+    );
+    let Some(cycle) = cycle else {
+        return place;
+    };
+    place.map_type(|ty| {
+        RecursiveType::inferred_place(
+            db,
+            cycle,
+            scope,
+            place_id,
+            requires_explicit_reexport.is_yes(),
+            considered_definitions == ConsideredDefinitions::EndOfScope,
+            ty,
+        )
+    })
+}
+
+/// Read a place query's cached body without wrapping it in another recursive reference.
+pub(crate) fn recursive_place_body<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    place_id: ScopedPlaceId,
+    explicit_reexport: bool,
+    end_of_scope: bool,
+) -> Type<'db> {
+    place_by_id_impl(
+        db,
+        scope,
+        place_id,
+        if explicit_reexport {
+            RequiresExplicitReExport::Yes
+        } else {
+            RequiresExplicitReExport::No
+        },
+        if end_of_scope {
+            ConsideredDefinitions::EndOfScope
+        } else {
+            ConsideredDefinitions::AllReachable
+        },
+    )
+    .0
+    .place
+    .ignore_possibly_undefined()
+    .unwrap_or_else(Type::unknown)
+}
+
 #[salsa::tracked(
     returns(copy),
-    cycle_initial=|_, id, _, _, _, _| Place::bound(Type::divergent(id)).into(),
-    cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, place: PlaceAndQualifiers<'db>, scope: ScopeId<'db>, _, _, _| {
+    cycle_initial=|_, id, _, _, _, _| (Place::bound(Type::divergent(id)).into(), Some(RecursiveCycle::new(id))),
+    cycle_fn=|db, cycle, previous: &(PlaceAndQualifiers<'db>, Option<RecursiveCycle>), result: (PlaceAndQualifiers<'db>, Option<RecursiveCycle>), scope: ScopeId<'db>, _, _, _| {
         let env = ProgramEnvironment::from_scope(scope);
-        place.cycle_normalized(db, &env, *previous, cycle)
+        (result.0.cycle_normalized(db, &env, previous.0, cycle), Some(RecursiveCycle::new(cycle.id())))
     },
     heap_size=ruff_memory_usage::heap_size
 )]
-pub(crate) fn place_by_id<'db>(
+fn place_by_id_impl<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    place_id: ScopedPlaceId,
+    requires_explicit_reexport: RequiresExplicitReExport,
+    considered_definitions: ConsideredDefinitions,
+) -> (PlaceAndQualifiers<'db>, Option<RecursiveCycle>) {
+    (
+        compute_place_by_id(
+            db,
+            scope,
+            place_id,
+            requires_explicit_reexport,
+            considered_definitions,
+        ),
+        None,
+    )
+}
+
+fn compute_place_by_id<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
     place_id: ScopedPlaceId,

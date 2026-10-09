@@ -175,7 +175,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &mut self,
         subscript: &ast::ExprSubscript,
     ) -> Result<Type<'db>, Type<'db>> {
-        let value_ty = self.infer_expression(&subscript.value, TypeContext::default());
+        let value_ty = self
+            .infer_expression(&subscript.value, TypeContext::default())
+            .resolve_type_alias(self.db());
 
         // If we have an implicit type alias like `MyList = list[T]`, and if `MyList` is being
         // used in another implicit type alias like `Numbers = MyList[int]`, then we infer the

@@ -166,6 +166,7 @@ mod newtype;
 mod overrides;
 mod protocol_class;
 mod recursive;
+pub(crate) use recursive::RecursiveCycle;
 pub(crate) use recursive::RecursiveMapping;
 pub use recursive::{RecursiveType, RecursiveVar, UnfoldResult};
 pub(crate) mod relation;
@@ -1718,7 +1719,7 @@ impl<'db> PropertyInstanceType<'db> {
             let accessor = accessor?;
             let function = accessor.as_function_literal().or_else(|| {
                 definition.and_then(|definition| {
-                    infer_definition_types(db, definition).function_type(definition)
+                    infer_definition_types(db, definition).function_type(db, definition)
                 })
             })?;
             Some((accessor, function))
@@ -2577,6 +2578,14 @@ impl<'db> Type<'db> {
         matches!(self, Type::TypeAlias(_) | Type::Recursive(_))
     }
 
+    fn has_alias_name(self, db: &'db dyn Db) -> bool {
+        match self {
+            Type::TypeAlias(_) => true,
+            Type::Recursive(recursive) => !recursive.inferred(db),
+            _ => false,
+        }
+    }
+
     pub fn is_notimplemented(&self, db: &'db dyn Db) -> bool {
         self.is_instance_of(db, KnownClass::NotImplementedType)
     }
@@ -2931,6 +2940,20 @@ impl<'db> Type<'db> {
             Type::KnownInstance(KnownInstanceType::TypeAliasType(type_alias)) => Some(type_alias),
             _ => None,
         }
+    }
+
+    /// Resolve references to inference results while retaining named type aliases.
+    fn resolve_inferred_type(self, db: &'db dyn Db) -> Self {
+        let mut ty = self;
+        let mut seen = SmallVec::<[Type<'db>; 4]>::new();
+        while let Type::Recursive(recursive) = ty
+            && recursive.inferred(db)
+            && !seen.contains(&ty)
+        {
+            seen.push(ty);
+            ty = recursive.unfold(db, &recursive.environment(db)).into_type();
+        }
+        ty
     }
 
     /// Resolve aliases and recursive binders at the outermost level.
@@ -3782,6 +3805,17 @@ impl<'db> Type<'db> {
         div: Type<'db>,
         nested: bool,
     ) -> Option<Self> {
+        if let Type::Recursive(recursive) = self
+            && recursive
+                .inference_cycle_marker(db)
+                .is_some_and(|marker| marker.same_divergent_marker(div))
+        {
+            return if nested {
+                None
+            } else {
+                Some(recursive.normalize_inference_cycle(db, div))
+            };
+        }
         if nested && (self.same_divergent_marker(div) || self.is_pending_narrowing()) {
             return None;
         }
@@ -3803,9 +3837,9 @@ impl<'db> Type<'db> {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             Type::Union(union) => union.recursive_type_normalized_impl(db, env, div, nested),
-            Type::Intersection(intersection) => intersection
-                .recursive_type_normalized_impl(db, env, div, nested)
-                .map(Type::Intersection),
+            Type::Intersection(intersection) => {
+                intersection.recursive_type_normalized_impl(db, env, div, nested)
+            }
             Type::EnumComplement(complement) => complement
                 .to_intersection(db, env)
                 .recursive_type_normalized_impl(db, env, div, nested),
@@ -9094,13 +9128,19 @@ impl<'db> Type<'db> {
             env: &ProgramEnvironment<'db>,
             ty: Type<'db>,
             context: &TypeRecursionContext<'db>,
-            visitor: &ActiveRecursionDetector<TypeAliasType<'db>>,
+            visitor: &ActiveRecursionDetector<Type<'db>>,
         ) -> Type<'db> {
             match ty {
-                Type::Recursive(recursive) => recursive
-                    .unfold(db, env)
-                    .map(|unfolded| to_meta_type_inner(db, env, unfolded, context, visitor))
-                    .into_type(),
+                Type::Recursive(recursive) => visitor.visit(
+                    &ty,
+                    || Type::Never,
+                    || {
+                        recursive
+                            .unfold(db, env)
+                            .map(|unfolded| to_meta_type_inner(db, env, unfolded, context, visitor))
+                            .unwrap_or(Type::Never)
+                    },
+                ),
                 Type::RecursiveVar(_) => {
                     unreachable!("semantic operation on an unbound recursive variable")
                 }
@@ -9245,7 +9285,7 @@ impl<'db> Type<'db> {
                     // Do not cache results: a projection made while another alias is active can omit
                     // classes that are only encountered later in that alias's union.
                     visitor.visit(
-                        &alias,
+                        &ty,
                         || Type::Never,
                         || {
                             context.meta_type.aliases.visit(
@@ -9549,11 +9589,13 @@ impl<'db> Type<'db> {
         }
 
         // Recursive singleton promotion only recurses into `NominalInstance` types (tuples
-        // and specialized generics). For all other types, return early.
+        // and specialized generics). Inferred references defer this decision until their
+        // bodies can be observed.
         if matches!(
             type_mapping,
             TypeMapping::Promote(_, PromotionKind::SingletonsOnly)
         ) && !matches!(self, Type::NominalInstance(_))
+            && !matches!(self, Type::Recursive(recursive) if recursive.inferred(db))
         {
             return self;
         }
@@ -10656,7 +10698,7 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Option<StaticClassLiteral<'db>> {
-        match self {
+        match self.resolve_type_alias(db) {
             Type::GenericAlias(generic) => Some(generic.origin(db)),
             Type::NominalInstance(instance)
                 if let ClassType::Generic(generic) = instance.class(db, env) =>
@@ -11098,7 +11140,7 @@ impl PromotionMode {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, get_size2::GetSize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum PromotionKind {
     /// Default promotion behaviour: recurse into nested types
     Regular,

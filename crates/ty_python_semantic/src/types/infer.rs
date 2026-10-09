@@ -229,6 +229,51 @@ fn normalize_collection_use_constraints<'db>(
     }
 }
 
+/// Inputs retained by a reference to the result of definition inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub enum DefinitionInferenceSource<'db> {
+    Definition(Definition<'db>),
+    Deferred(Definition<'db>),
+    FunctionDefaults(Definition<'db>),
+}
+
+impl<'db> DefinitionInferenceSource<'db> {
+    pub(super) fn scope(self, db: &'db dyn Db) -> ScopeId<'db> {
+        self.definition().scope(db)
+    }
+    fn definition(self) -> Definition<'db> {
+        match self {
+            Self::Definition(definition)
+            | Self::Deferred(definition)
+            | Self::FunctionDefaults(definition) => definition,
+        }
+    }
+
+    pub(super) fn body(
+        self,
+        db: &'db dyn Db,
+        definition: Definition<'db>,
+        declaration: bool,
+    ) -> Type<'db> {
+        let owner = self.definition();
+        let inference = match self {
+            Self::Definition(owner) => infer_definition_types(db, owner),
+            Self::Deferred(owner) => infer_deferred_types(db, owner),
+            Self::FunctionDefaults(owner) => infer_function_default_types(db, owner),
+        };
+        let types = inference.raw_definition_types();
+        if declaration {
+            types
+                .declaration_type(owner, definition)
+                .map(|ty| ty.inner_type())
+        } else {
+            types.binding_type(owner, definition)
+        }
+        .or_else(|| inference.fallback_type())
+        .unwrap_or_else(Type::unknown)
+    }
+}
+
 /// Infer all types for a [`Definition`] (including sub-expressions).
 /// Use when resolving a place use or public type of a place.
 #[salsa::tracked(
@@ -237,7 +282,7 @@ fn normalize_collection_use_constraints<'db>(
         DefinitionInference::cycle_initial(db, definition, Type::divergent(id))
     },
     cycle_fn=|db: &'db dyn Db, cycle, previous: &DefinitionInference<'db>, inference: DefinitionInference<'db>, definition: Definition<'db>| {
-        inference.cycle_normalized(db, previous, cycle, definition)
+        inference.cycle_normalized(db, previous, cycle, DefinitionInferenceSource::Definition(definition))
     },
     heap_size=ruff_memory_usage::heap_size
 )]
@@ -403,7 +448,7 @@ impl<'db> FunctionDecoratorInference<'db> {
         DefinitionInference::cycle_initial(db, definition, Type::divergent(id))
     },
     cycle_fn=|db: &'db dyn Db, cycle, previous: &DefinitionInference<'db>, inference: DefinitionInference<'db>, definition: Definition<'db>| {
-        inference.cycle_normalized(db, previous, cycle, definition)
+        inference.cycle_normalized(db, previous, cycle, DefinitionInferenceSource::Deferred(definition))
     },
     heap_size=ruff_memory_usage::heap_size
 )]
@@ -449,7 +494,7 @@ pub(crate) fn infer_deferred_types<'db>(
         DefinitionInference::cycle_initial(db, definition, Type::divergent(id))
     },
     cycle_fn=|db: &'db dyn Db, cycle, previous: &DefinitionInference<'db>, inference: DefinitionInference<'db>, definition: Definition<'db>| {
-        inference.cycle_normalized(db, previous, cycle, definition)
+        inference.cycle_normalized(db, previous, cycle, DefinitionInferenceSource::FunctionDefaults(definition))
     },
     heap_size=ruff_memory_usage::heap_size
 )]
@@ -993,6 +1038,7 @@ pub(crate) fn original_class_type<'db>(
     inference
         .undecorated_type()
         .unwrap_or_else(|| inference.binding_type(definition))
+        .resolve_type_alias(db)
         .as_class_literal()
 }
 
@@ -1012,7 +1058,7 @@ pub(crate) fn nearest_enclosing_function<'db>(
         .find_map(|(_, ancestor_scope)| {
             let func = ancestor_scope.node().as_function()?;
             let definition = semantic.expect_single_definition(func);
-            infer_definition_types(db, definition).function_type(definition)
+            infer_definition_types(db, definition).function_type(db, definition)
         })
 }
 
@@ -1474,6 +1520,9 @@ struct DeferredAndUndecorated<'db> {
 
 #[derive(Debug, Eq, PartialEq, get_size2::GetSize, Default, salsa::SalsaValue)]
 struct OtherDefinitionInferenceExtra<'db> {
+    /// Current bodies of the query-backed types exposed through `DefinitionInference::types`.
+    recursive_types: Option<DefinitionTypes<'db>>,
+
     /// Aliases whose type-expression diagnostics are needed by this region.
     implicit_aliases: Box<[Definition<'db>]>,
 
@@ -1586,6 +1635,17 @@ impl<'db> DefinitionInferenceExtra<'db> {
 }
 
 impl<'db> DefinitionInference<'db> {
+    /// Read the cached bodies independently of the references exposed to dependent queries.
+    fn raw_definition_types(&self) -> &DefinitionTypes<'db> {
+        if let Some(DefinitionInferenceExtra::Other(extra)) = self.extra.as_deref()
+            && let Some(types) = &extra.recursive_types
+        {
+            types
+        } else {
+            &self.types
+        }
+    }
+
     fn cycle_initial(
         db: &'db dyn Db,
         definition: Definition<'db>,
@@ -1672,8 +1732,9 @@ impl<'db> DefinitionInference<'db> {
         db: &'db dyn Db,
         previous_inference: &DefinitionInference<'db>,
         cycle: &salsa::Cycle,
-        definition: Definition<'db>,
+        source: DefinitionInferenceSource<'db>,
     ) -> DefinitionInference<'db> {
+        let definition = source.definition();
         let env = ProgramEnvironment::from_definition(definition);
         if cycle.iteration() > crate::TAINTED_CYCLES {
             self.widen_comparison_truthiness(db, &env, previous_inference);
@@ -1686,7 +1747,7 @@ impl<'db> DefinitionInference<'db> {
         self.types = std::mem::take(&mut self.types).cycle_normalized(
             db,
             &env,
-            &previous_inference.types,
+            previous_inference.raw_definition_types(),
             cycle,
             definition,
         );
@@ -1731,6 +1792,55 @@ impl<'db> DefinitionInference<'db> {
                 cycle,
             );
         }
+
+        let raw_types = std::mem::take(&mut self.types);
+        self.types = DefinitionTypes::from_parts(
+            definition,
+            raw_types
+                .bindings(definition)
+                .map(|(binding, ty)| {
+                    (
+                        binding,
+                        RecursiveType::inferred_definition(
+                            db,
+                            &env,
+                            cycle.id(),
+                            source,
+                            binding,
+                            false,
+                            ty,
+                        ),
+                    )
+                })
+                .collect(),
+            raw_types
+                .declarations(definition)
+                .map(|(declaration, ty)| {
+                    (
+                        declaration,
+                        ty.map_type(|ty| {
+                            RecursiveType::inferred_definition(
+                                db,
+                                &env,
+                                cycle.id(),
+                                source,
+                                declaration,
+                                true,
+                                ty,
+                            )
+                        }),
+                    )
+                })
+                .collect(),
+        );
+        let mut extra = self
+            .extra
+            .take()
+            .map_or_else(OtherDefinitionInferenceExtra::default, |extra| {
+                extra.into_other()
+            });
+        extra.recursive_types = Some(raw_types);
+        self.extra = Some(Box::new(DefinitionInferenceExtra::Other(Box::new(extra))));
 
         self
     }
@@ -1908,7 +2018,11 @@ impl<'db> DefinitionInference<'db> {
         }
     }
 
-    pub(crate) fn function_type(&self, definition: Definition<'db>) -> Option<FunctionType<'db>> {
+    pub(crate) fn function_type(
+        &self,
+        db: &'db dyn Db,
+        definition: Definition<'db>,
+    ) -> Option<FunctionType<'db>> {
         let ty = if let Some(undecorated) = self.undecorated_type() {
             undecorated
         } else {
@@ -1917,7 +2031,7 @@ impl<'db> DefinitionInference<'db> {
                 .inner_type()
         };
 
-        ty.as_function_literal()
+        ty.resolve_type_alias(db).as_function_literal()
     }
 }
 

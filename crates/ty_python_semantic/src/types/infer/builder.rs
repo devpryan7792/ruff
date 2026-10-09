@@ -2137,7 +2137,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn function_type(&self, function: &ast::StmtFunctionDef) -> Option<FunctionType<'db>> {
         let definition = self.index.expect_single_definition(function);
-        infer_definition_types(self.db(), definition).function_type(definition)
+        infer_definition_types(self.db(), definition).function_type(self.db(), definition)
     }
 
     fn current_function_type(&self) -> Option<FunctionType<'db>> {
@@ -12236,6 +12236,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             (_, undecorated_type) => {
                 collection_use_constraints.shrink_to_fit();
                 let extra = OtherDefinitionInferenceExtra {
+                    recursive_types: None,
                     implicit_aliases: implicit_aliases.into_iter().collect(),
                     comparison_truthiness: FrozenMap::from(comparison_truthiness),
                     string_annotations: FrozenSet::from(string_annotations),

@@ -11,6 +11,7 @@ use ty_python_core::definition::Definition;
 
 use super::{Tuple, TupleSpec, TupleSpecBuilder, TupleType, VariableLengthTuple, VariableSegment};
 use crate::types::instance::NominalInstanceType;
+use crate::types::recursive::RecursiveDefinitionIdentity;
 use crate::types::set_theoretic::TypeNormalization;
 use crate::types::visitor::{TypeCollector, TypeVisitor, walk_type_with_recursion_guard};
 use crate::types::{BoundTypeVarInstance, Type, UnionBuilder};
@@ -103,8 +104,8 @@ struct ShapeDependencies<'db> {
 
 struct ShapeObserver<'db> {
     env: ProgramEnvironment<'db>,
-    active: FxHashSet<Definition<'db>>,
-    declarations: FxHashMap<Definition<'db>, ShapeDependencies<'db>>,
+    active: FxHashSet<RecursiveDefinitionIdentity<'db>>,
+    declarations: FxHashMap<RecursiveDefinitionIdentity<'db>, ShapeDependencies<'db>>,
     declaration_body: Option<(Definition<'db>, Type<'db>)>,
 }
 
@@ -184,7 +185,11 @@ impl<'db> ShapeObserver<'db> {
         match ty {
             Type::TypeAlias(alias) => {
                 let definition = alias.definition(db);
-                let body = self.declaration(db, definition, |db| alias.raw_value_type(db));
+                let body = self.declaration(
+                    db,
+                    RecursiveDefinitionIdentity::Definition(definition),
+                    |db| alias.raw_value_type(db),
+                );
                 result.error = body.error;
                 for parameter in body.parameters {
                     let mapped = alias.apply_to_node_structural(db, Type::TypeVar(parameter));
@@ -198,7 +203,7 @@ impl<'db> ShapeObserver<'db> {
                 }
             }
             Type::Recursive(recursive) => {
-                let definition = recursive.definition(db);
+                let definition = recursive.definition_identity(db);
                 let body = self.declaration(db, definition, |db| recursive.shape_body(db));
                 result.error = body.error;
                 for parameter in body.parameters {
@@ -248,7 +253,7 @@ impl<'db> ShapeObserver<'db> {
     fn declaration(
         &mut self,
         db: &'db dyn Db,
-        definition: Definition<'db>,
+        definition: RecursiveDefinitionIdentity<'db>,
         body: impl FnOnce(&'db dyn Db) -> Type<'db>,
     ) -> ShapeDependencies<'db> {
         if let Some(result) = self.declarations.get(&definition) {
@@ -261,7 +266,11 @@ impl<'db> ShapeObserver<'db> {
             };
         }
         let body = match self.declaration_body {
-            Some((current, value)) if current == definition => value,
+            Some((current, value))
+                if RecursiveDefinitionIdentity::Definition(current) == definition =>
+            {
+                value
+            }
             _ => body(db),
         };
         let result = self.dependencies(db, body);

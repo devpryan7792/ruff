@@ -59,16 +59,31 @@
 //! ```
 //!
 //! Tuple subscripting then selects the element at index 1: `x[1]: Tree[list[int]] | None`.
+//!
+//! Cyclic value inference also needs references whose identities survive changes to their bodies.
+//! For example, a decorator can return a tuple containing the decorated function. If each read
+//! copies the previous tuple, every inference iteration can add another tuple layer. An inferred
+//! recursive application identifies one output of its producing query; that query stores the
+//! current body separately. Downstream substitutions are retained on the application and replayed
+//! when an operation observes the body.
+//!
+//! Inference recovery preserves an outer constructor and widens references nested inside it.
+//! References at the same structural depth can form mutually recursive equations, so their
+//! normalization is a separate query with the original inference marker as its cycle value.
 
 use std::cell::{Cell, RefCell};
 
 use rustc_hash::FxHashSet;
+use salsa::plumbing::AsId;
 use ty_python_core::definition::Definition;
+use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::place_table;
+use ty_python_core::scope::ScopeId;
 use ty_python_core::semantic_index;
 
 use super::constraints::{ConstraintSet, IteratorConstraintsExtension};
 use super::generics::{ApplySpecialization, Specialization};
+use super::infer::DefinitionInferenceSource;
 use super::relation::{TypeRelation, TypeRelationChecker};
 use super::set_theoretic::TypeNormalization;
 use super::type_alias::AliasCycleSummary;
@@ -79,7 +94,7 @@ use super::{
     GenericContext, MaterializationKind, ProtocolInstanceType, SelfBinding, Type, TypeContext,
     TypeMapping, TypedDictType, VarianceTerm,
 };
-use crate::{Db, ProgramEnvironment};
+use crate::{Db, FxOrderSet, Program, ProgramEnvironment};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 enum RecursiveSpecializationBase<'db> {
@@ -276,6 +291,7 @@ impl<'db> RecursiveSpecialization<'db> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub enum RecursiveOperation<'db> {
     Materialize(MaterializationKind, bool),
+    Promote(super::PromotionMode, super::PromotionKind),
     Specialize(RecursiveSpecialization<'db>, Option<MaterializationKind>),
     BindLegacy(BindingContext<'db>),
     Freshen(GenericContext<'db>, u32),
@@ -324,6 +340,7 @@ impl<'db> RecursiveOperation<'db> {
     pub(super) fn with_mapping<T>(&self, f: impl FnOnce(TypeMapping<'_, 'db>) -> T) -> T {
         match self {
             Self::Materialize(kind, _) => f(TypeMapping::Materialize(*kind)),
+            Self::Promote(mode, kind) => f(TypeMapping::Promote(*mode, *kind)),
             Self::Specialize(specialization, kind) => {
                 specialization.with_mapping(|specialization| {
                     f(match kind {
@@ -452,10 +469,95 @@ impl RecursiveSubstitution<'_> {
 }
 
 /// Identifies an alias query and names its recursive binder and variables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct RecursiveCycle(salsa::Id);
 
 impl get_size2::GetSize for RecursiveCycle {}
+
+impl RecursiveCycle {
+    pub(crate) fn new(id: salsa::Id) -> Self {
+        Self(id)
+    }
+}
+
+/// Identifies one output of an inference query independently of its provisional value.
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+struct DefinitionCycle<'db> {
+    query: RecursiveCycle,
+    definition: Definition<'db>,
+    declaration: bool,
+}
+
+/// Identifies a recursive constructor independently of its current application.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum RecursiveDefinitionIdentity<'db> {
+    Definition(Definition<'db>),
+    Inferred(RecursiveCycle),
+}
+
+/// Source metadata for named aliases and anonymous inference equations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub enum RecursiveOrigin<'db> {
+    Alias(Definition<'db>),
+    Inferred(InferredOrigin<'db>),
+}
+
+/// Free-variable metadata for an inference result, retained without its provisional body.
+/// Bound variables are formal arguments; runtime `TypeVar` objects remain captures until
+/// a binding operation turns them into bound variables.
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+pub struct InferredOrigin<'db> {
+    #[returns(copy)]
+    program: Program<'db>,
+    #[returns(copy)]
+    query: RecursiveCycle,
+    #[returns(ref)]
+    captures: Box<[Type<'db>]>,
+}
+
+impl get_size2::GetSize for InferredOrigin<'_> {}
+
+/// A closed recursive body or a reference to a separately cached inference result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub enum RecursiveBody<'db> {
+    Bound(Type<'db>),
+    Definition {
+        source: DefinitionInferenceSource<'db>,
+        definition: Definition<'db>,
+        declaration: bool,
+    },
+    Place {
+        scope: ScopeId<'db>,
+        place: ScopedPlaceId,
+        explicit_reexport: bool,
+        end_of_scope: bool,
+    },
+}
+
+impl<'db> RecursiveBody<'db> {
+    fn value(self, db: &'db dyn Db) -> Type<'db> {
+        match self {
+            Self::Bound(ty) => ty,
+            Self::Definition {
+                source,
+                definition,
+                declaration,
+            } => source.body(db, definition, declaration),
+            Self::Place {
+                scope,
+                place,
+                explicit_reexport,
+                end_of_scope,
+            } => crate::place::recursive_place_body(
+                db,
+                scope,
+                place,
+                explicit_reexport,
+                end_of_scope,
+            ),
+        }
+    }
+}
 
 /// An application of a structural recursive type constructor.
 /// The private body remains unspecialized; `arguments` records this application's
@@ -465,14 +567,14 @@ impl get_size2::GetSize for RecursiveCycle {}
 /// Use the binding operations in this module to construct recursive types.
 #[salsa::interned(debug, constructor=new_internal, heap_size=ruff_memory_usage::heap_size)]
 pub struct RecursiveType<'db> {
-    /// The defining symbol of the implicit alias, including for qualified references.
+    /// The alias definition or the program and query that produce an inferred value.
     #[returns(copy)]
-    pub(super) definition: Definition<'db>,
+    pub(super) origin: RecursiveOrigin<'db>,
     /// Names the binder and distinguishes provisional types of different alias queries.
     #[returns(copy)]
-    cycle: RecursiveCycle,
+    pub(super) cycle: RecursiveCycle,
     #[returns(copy)]
-    body: Type<'db>,
+    body: RecursiveBody<'db>,
     /// The actual arguments for this application, which may themselves contain type variables.
     /// They are applied when unfolding; the stored body remains unspecialized.
     #[returns(copy)]
@@ -498,7 +600,7 @@ impl<'db> RecursiveType<'db> {
             recursive: RecursiveType<'db>,
             (): (),
         ) -> AliasCycleSummary<'db> {
-            let mut summary = AliasCycleSummary::from_type(db, recursive.body(db));
+            let mut summary = AliasCycleSummary::from_type(db, recursive.body(db).value(db));
             // Nested bodies can refer to an enclosing binder. Close only the cycle marker,
             // so recovery never exposes an unbound variable as a standalone type.
             if let Some(Type::RecursiveVar(variable)) = summary.cycle {
@@ -521,14 +623,14 @@ impl<'db> RecursiveType<'db> {
         let arguments = parameters.map(|parameters| parameters.identity_specialization(db));
         Self::new_internal(
             db,
-            definition,
+            RecursiveOrigin::Alias(definition),
             cycle,
-            Type::RecursiveVar(RecursiveVar::new_internal(
+            RecursiveBody::Bound(Type::RecursiveVar(RecursiveVar::new_internal(
                 db,
                 cycle,
                 arguments,
                 Box::<[RecursiveOperation<'_>]>::default(),
-            )),
+            ))),
             arguments,
             Box::<[RecursiveOperation<'_>]>::default(),
         )
@@ -577,13 +679,148 @@ impl<'db> RecursiveType<'db> {
         } else {
             Type::Recursive(Self::new_internal(
                 db,
-                self.definition(db),
+                self.origin(db),
                 self.cycle(db),
-                body,
+                RecursiveBody::Bound(body),
                 self.arguments(db),
                 Box::<[RecursiveOperation<'_>]>::default(),
             ))
         }
+    }
+
+    /// Preserve the query identity independently of its current approximation.
+    pub(super) fn inferred_definition(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        cycle: salsa::Id,
+        source: DefinitionInferenceSource<'db>,
+        definition: Definition<'db>,
+        declaration: bool,
+        result: Type<'db>,
+    ) -> Type<'db> {
+        let binder = RecursiveCycle(
+            DefinitionCycle::new(db, RecursiveCycle(cycle), definition, declaration).as_id(),
+        );
+        Self::inferred_reference(
+            db,
+            env,
+            binder,
+            RecursiveCycle(cycle),
+            RecursiveBody::Definition {
+                source,
+                definition,
+                declaration,
+            },
+            result,
+        )
+    }
+
+    /// Preserve the identity of a public-place query whose result is still being inferred.
+    pub(crate) fn inferred_place(
+        db: &'db dyn Db,
+        cycle: RecursiveCycle,
+        scope: ScopeId<'db>,
+        place: ScopedPlaceId,
+        explicit_reexport: bool,
+        end_of_scope: bool,
+        result: Type<'db>,
+    ) -> Type<'db> {
+        let env = ProgramEnvironment::from_scope(scope);
+        Self::inferred_reference(
+            db,
+            &env,
+            cycle,
+            cycle,
+            RecursiveBody::Place {
+                scope,
+                place,
+                explicit_reexport,
+                end_of_scope,
+            },
+            result,
+        )
+    }
+
+    /// Represent structural results without embedding their provisional bodies in the key.
+    /// Leaves keep their existing identities. The application's parameters include lexical
+    /// variables and variables in the current result so substitutions do not change the query
+    /// that constructs the body.
+    fn inferred_reference(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        binder: RecursiveCycle,
+        query: RecursiveCycle,
+        body: RecursiveBody<'db>,
+        result: Type<'db>,
+    ) -> Type<'db> {
+        struct Children<'a, 'db> {
+            env: &'a ProgramEnvironment<'db>,
+            found: Cell<bool>,
+        }
+        impl<'db> TypeVisitor<'db> for Children<'_, 'db> {
+            fn program_environment(&self) -> &ProgramEnvironment<'db> {
+                self.env
+            }
+            fn should_visit_lazy_type_attributes(&self) -> bool {
+                false
+            }
+            fn notify_skipped_lazy_type_attributes(&self) {
+                self.found.set(true);
+            }
+            fn visit_type(&self, _: &'db dyn Db, _: Type<'db>) {
+                self.found.set(true);
+            }
+        }
+        let visitor::TypeKind::NonAtomic(structure) = result.into() else {
+            return result;
+        };
+        let children = Children {
+            env,
+            found: Cell::new(false),
+        };
+        visitor::walk_non_atomic_type(db, structure, &children);
+        if !children.found.get() {
+            return result;
+        }
+        let mut variables = FxOrderSet::default();
+        let scope = match body {
+            RecursiveBody::Definition { source, .. } => Some(source.scope(db)),
+            RecursiveBody::Place { scope, .. } => Some(scope),
+            RecursiveBody::Bound(_) => None,
+        };
+        if let Some(scope) = scope {
+            let index = semantic_index(db, scope.program_file(db));
+            for (_, scope) in index.ancestor_scopes(scope.file_scope_id(db)) {
+                if let Some(context) = GenericContext::lexical_of_node(db, scope.node(), index) {
+                    variables.extend(context.variables(db));
+                }
+            }
+        }
+        let (stored, _) = stored_variables(db, env, result);
+        let mut captures = Vec::new();
+        for variable in stored {
+            if let Type::TypeVar(variable) = variable {
+                variables.insert(variable);
+            } else {
+                captures.push(variable);
+            }
+        }
+        let arguments = (!variables.is_empty()).then(|| {
+            GenericContext::from_typevar_instances(db, env, variables).identity_specialization(db)
+        });
+        Type::Recursive(Self::new_internal(
+            db,
+            RecursiveOrigin::Inferred(InferredOrigin::new(
+                db,
+                env.program(db),
+                query,
+                captures.into_boxed_slice(),
+            )),
+            binder,
+            body,
+            arguments,
+            Box::<[RecursiveOperation<'_>]>::default(),
+        ))
     }
 
     pub(super) fn with_arguments(
@@ -593,7 +830,7 @@ impl<'db> RecursiveType<'db> {
     ) -> Self {
         Self::new_internal(
             db,
-            self.definition(db),
+            self.origin(db),
             self.cycle(db),
             self.body(db),
             arguments,
@@ -604,7 +841,7 @@ impl<'db> RecursiveType<'db> {
     fn with_operations(self, db: &'db dyn Db, operations: Box<[RecursiveOperation<'db>]>) -> Self {
         Self::new_internal(
             db,
-            self.definition(db),
+            self.origin(db),
             self.cycle(db),
             self.body(db),
             self.base_arguments(db),
@@ -691,7 +928,12 @@ impl<'db> RecursiveType<'db> {
         heap_size=ruff_memory_usage::heap_size
     )]
     fn captured_variables(self, db: &'db dyn Db) -> (Box<[Type<'db>]>, bool) {
-        let body = self.body(db);
+        if let RecursiveOrigin::Inferred(origin) = self.origin(db) {
+            // Observing the producing query here would make substitution depend on its
+            // changing body and defeat the stable identity used for inference convergence.
+            return (origin.captures(db).clone(), true);
+        }
+        let body = self.body(db).value(db);
         let (variables, complete) = stored_variables(db, &self.environment(db), body);
         let variables = variables
             .into_iter()
@@ -727,23 +969,54 @@ impl<'db> RecursiveType<'db> {
             .map(|arguments| arguments.generic_context(db))
     }
 
-    /// The declared alias name, shared by all specializations of this constructor.
-    pub(super) fn name(self, db: &'db dyn Db) -> &'db str {
-        let definition = self.definition(db);
-        // Qualified uses retain the original declaration's symbol, not the access expression.
-        place_table(db, definition.scope(db))
-            .symbol(definition.place(db).expect_symbol())
-            .name()
+    /// Identify the constructor before traversing its declaration or inference body.
+    pub(super) fn definition_identity(self, db: &'db dyn Db) -> RecursiveDefinitionIdentity<'db> {
+        match self.origin(db) {
+            RecursiveOrigin::Alias(definition) => {
+                RecursiveDefinitionIdentity::Definition(definition)
+            }
+            RecursiveOrigin::Inferred(..) => RecursiveDefinitionIdentity::Inferred(self.cycle(db)),
+        }
+    }
+
+    pub(super) fn inferred(self, db: &'db dyn Db) -> bool {
+        matches!(self.origin(db), RecursiveOrigin::Inferred(..))
+    }
+
+    /// Expose the outer structure during inference recovery. Normalizing an unguarded
+    /// reference can return to this query, while nested references are widened by the caller.
+    #[salsa::tracked(
+        returns(copy),
+        cycle_initial=|_, _, _, marker: Type<'db>| marker,
+        heap_size=ruff_memory_usage::heap_size
+    )]
+    pub(super) fn normalize_inference_cycle(self, db: &'db dyn Db, marker: Type<'db>) -> Type<'db> {
+        let env = self.environment(db);
+        self.unfold(db, &env)
+            .map(|body| {
+                body.recursive_type_normalized_impl(db, &env, marker, false)
+                    .unwrap_or(marker)
+            })
+            .unwrap_or(marker)
+    }
+
+    /// Recover the producing query's marker independently of this output's binder identity.
+    pub(super) fn inference_cycle_marker(self, db: &'db dyn Db) -> Option<Type<'db>> {
+        match self.origin(db) {
+            RecursiveOrigin::Inferred(origin) => Some(Type::divergent(origin.query(db).0)),
+            RecursiveOrigin::Alias(_) => None,
+        }
     }
 
     /// The source alias's definition and name, if this binder comes from an alias.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Keep alias metadata optional for inferred recursive types"
-    )]
     pub(super) fn alias(self, db: &'db dyn Db) -> Option<(Definition<'db>, &'db str)> {
-        // Only implicit alias inference constructs recursive types at present.
-        Some((self.definition(db), self.name(db)))
+        let RecursiveOrigin::Alias(definition) = self.origin(db) else {
+            return None;
+        };
+        let name = place_table(db, definition.scope(db))
+            .symbol(definition.place(db).expect_symbol())
+            .name();
+        Some((definition, name))
     }
 
     /// Restore the formal arguments and remove materialization for constructor analysis.
@@ -760,7 +1033,12 @@ impl<'db> RecursiveType<'db> {
 
     /// The program in which the recursive type's body was constructed.
     pub fn environment(self, db: &'db dyn Db) -> ProgramEnvironment<'db> {
-        ProgramEnvironment::from_definition(self.definition(db))
+        match self.origin(db) {
+            RecursiveOrigin::Alias(definition) => ProgramEnvironment::from_definition(definition),
+            RecursiveOrigin::Inferred(origin) => {
+                ProgramEnvironment::from_program(origin.program(db))
+            }
+        }
     }
 
     /// Substitute closed types for references before exposing the body.
@@ -778,7 +1056,7 @@ impl<'db> RecursiveType<'db> {
 
     /// The unspecialized finite body used to analyze tuple unpack dependencies.
     pub(super) fn shape_body(self, db: &'db dyn Db) -> Type<'db> {
-        self.body(db)
+        self.body(db).value(db)
     }
 
     /// Instantiate one body node with the same environment and operation order as unfolding.
@@ -816,7 +1094,7 @@ impl<'db> RecursiveType<'db> {
         heap_size=ruff_memory_usage::heap_size
     )]
     fn unfolded_body(self, db: &'db dyn Db) -> Type<'db> {
-        self.close_body_node(db, self.body(db))
+        self.close_body_node(db, self.body(db).value(db))
     }
 
     fn close_body_node(self, db: &'db dyn Db, node: Type<'db>) -> Type<'db> {
@@ -896,18 +1174,20 @@ impl<'db> RecursiveType<'db> {
             }
             TypeMapping::ApplyRecursiveSubstitution(RecursiveMapping(substitution)) => {
                 // This binder shadows the target in its body, but not in its arguments.
-                let body = if self.cycle(db) == substitution.cycle(db) {
-                    self.body(db)
-                } else {
-                    self.body(db)
-                        .apply_type_mapping_impl(db, mapping, tcx, visitor)
+                let body = match self.body(db) {
+                    RecursiveBody::Bound(body) if self.cycle(db) != substitution.cycle(db) => {
+                        RecursiveBody::Bound(
+                            body.apply_type_mapping_impl(db, mapping, tcx, visitor),
+                        )
+                    }
+                    body => body,
                 };
                 let arguments = self
                     .base_arguments(db)
                     .map(|arguments| arguments.apply_type_mapping_impl(db, mapping, &[], visitor));
                 Type::Recursive(Self::new_internal(
                     db,
-                    self.definition(db),
+                    self.origin(db),
                     self.cycle(db),
                     body,
                     arguments,
@@ -916,6 +1196,21 @@ impl<'db> RecursiveType<'db> {
                         .map(|operation| operation.map_types(db, mapping, visitor))
                         .collect::<Box<[_]>>(),
                 ))
+            }
+            TypeMapping::Promote(mode, kind) if self.inferred(db) => {
+                let operation = RecursiveOperation::Promote(*mode, *kind);
+                if self
+                    .operations(db)
+                    .iter()
+                    .rev()
+                    .take_while(|operation| matches!(operation, RecursiveOperation::Promote(..)))
+                    .any(|previous| previous == &operation)
+                {
+                    return Type::Recursive(self);
+                }
+                let mut operations = self.operations(db).to_vec();
+                operations.push(operation);
+                Type::Recursive(self.with_operations(db, operations.into_boxed_slice()))
             }
             mapping if let Some(operation) = RecursiveOperation::substitution(mapping) => {
                 // These mappings substitute free variables, which are captured by the alias's
@@ -1215,10 +1510,34 @@ impl<'db> VarianceInferable<'db> for RecursiveType<'db> {
     fn variance_of(
         self,
         db: &'db dyn Db,
-        _env: &ProgramEnvironment<'db>,
+        env: &ProgramEnvironment<'db>,
         typevar: BoundTypeVarIdentity<'db>,
     ) -> VarianceTerm<'db> {
-        VarianceTerm::variable(db, VarianceOrigin::Recursive(self), typevar)
+        let constructor = self.constructor(db);
+        let Some(arguments) = self.arguments(db) else {
+            return VarianceTerm::variable(db, VarianceOrigin::Recursive(constructor), typevar);
+        };
+        let parameters = arguments.generic_context(db);
+        let argument_variances =
+            parameters
+                .variables(db)
+                .zip(arguments.types(db))
+                .map(|(parameter, argument)| {
+                    argument
+                        .variance_of(db, env, typevar)
+                        .compose_thunk(db, || {
+                            VarianceTerm::variable(
+                                db,
+                                VarianceOrigin::Recursive(constructor),
+                                parameter.identity(db),
+                            )
+                        })
+                });
+        let capture_variance = (!parameters
+            .variables(db)
+            .any(|parameter| parameter.identity(db) == typevar))
+        .then(|| VarianceTerm::variable(db, VarianceOrigin::Recursive(constructor), typevar));
+        VarianceTerm::join(db, argument_variances.chain(capture_variance))
     }
 }
 
@@ -1285,8 +1604,9 @@ fn structurally_static<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: 
                     }
                     match recursive.body(db) {
                         // A provisional binder supplies no evidence about the final body.
-                        Type::RecursiveVar(_) => self.is_static.set(false),
-                        body => self.visit_type(db, body),
+                        RecursiveBody::Bound(Type::RecursiveVar(_)) => self.is_static.set(false),
+                        RecursiveBody::Bound(body) => self.visit_type(db, body),
+                        _ => self.is_static.set(false),
                     }
                 }
                 _ => {
@@ -1337,7 +1657,7 @@ fn stored_variables<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
-) -> (FxHashSet<Type<'db>>, bool) {
+) -> (FxOrderSet<Type<'db>>, bool) {
     struct VariableVisitor<'a, 'db> {
         env: &'a ProgramEnvironment<'db>,
         seen: RefCell<FxHashSet<Type<'db>>>,
@@ -1404,7 +1724,7 @@ fn stored_variables<'db>(
         pending: RefCell::new(vec![ty]),
         complete: Cell::new(true),
     };
-    let mut variables = FxHashSet::default();
+    let mut variables = FxOrderSet::default();
     loop {
         let Some(ty) = visitor.pending.borrow_mut().pop() else {
             break;
@@ -1468,5 +1788,106 @@ impl Type<'_> {
             !matches!(self, Self::RecursiveVar(_)),
             "semantic operation on an unbound recursive variable"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::system::DbWithWritableSystem;
+    use salsa::plumbing::AsId;
+    use ty_python_core::ProgramFile;
+
+    use super::RecursiveType;
+    use crate::db::tests::setup_db;
+    use crate::place::{Place, global_symbol};
+    use crate::types::infer::DefinitionInferenceSource;
+    use crate::types::{
+        BindingContext, KnownClass, KnownInstanceType, Type, TypeContext, TypeMapping,
+    };
+
+    #[test]
+    fn inferred_values_promote_nested_singletons() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented("/src/a.py", "value = (None,)\n")?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = ProgramFile::new(db, system_path_to_file(db, "/src/a.py")?, env.program(db));
+        let Place::Defined(place) = global_symbol(db, file, "value").place else {
+            anyhow::bail!("expected value's binding");
+        };
+        let definition = place
+            .provenance
+            .definition()
+            .ok_or_else(|| anyhow::anyhow!("expected value's definition"))?;
+        let reference = RecursiveType::inferred_definition(
+            db,
+            &env,
+            definition.as_id(),
+            DefinitionInferenceSource::Definition(definition),
+            definition,
+            false,
+            place.ty,
+        );
+        assert!(matches!(reference, Type::Recursive(_)));
+        let promoted = reference
+            .promote_singletons_recursively(db, &env)
+            .resolve_inferred_type(db);
+        assert_eq!(
+            promoted.display(db, &env).to_string(),
+            "tuple[None | Unknown]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inferred_values_bind_legacy_type_variables() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            "from typing import TypeVar\nT = TypeVar('T', bound=int)\n",
+        )?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = ProgramFile::new(db, system_path_to_file(db, "/src/a.py")?, env.program(db));
+        let value = global_symbol(db, file, "T").place.expect_type();
+        let Type::KnownInstance(KnownInstanceType::TypeVar(typevar)) = value else {
+            anyhow::bail!("expected a runtime TypeVar object");
+        };
+        let definition = typevar
+            .definition(db)
+            .ok_or_else(|| anyhow::anyhow!("expected T's definition"))?;
+        let reference = RecursiveType::inferred_definition(
+            db,
+            &env,
+            definition.as_id(),
+            DefinitionInferenceSource::Definition(definition),
+            definition,
+            false,
+            value,
+        );
+        assert!(matches!(reference, Type::Recursive(_)));
+        let context = BindingContext::Definition(definition);
+        let bound = reference.apply_type_mapping(
+            db,
+            &env,
+            &TypeMapping::BindLegacyTypevars(context),
+            TypeContext::default(),
+        );
+        let Type::TypeVar(variable) = bound.resolve_inferred_type(db) else {
+            anyhow::bail!("binding an inferred value must bind its runtime TypeVar object");
+        };
+        assert_eq!(variable.binding_context(db), context);
+        let rebound = bound.apply_type_mapping(
+            db,
+            &env,
+            &TypeMapping::BindLegacyTypevars(BindingContext::Synthetic(env.program(db))),
+            TypeContext::default(),
+        );
+        assert_eq!(rebound.resolve_inferred_type(db), Type::TypeVar(variable));
+        let int = KnownClass::Int.to_instance(db, &env);
+        let specialized = bound.substitute_one_typevar(db, &env, variable, int);
+        assert_eq!(specialized.resolve_inferred_type(db), int);
+        Ok(())
     }
 }

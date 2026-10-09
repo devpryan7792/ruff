@@ -724,11 +724,11 @@ impl<'db> UnionBuilder<'db> {
 
     /// Adds a type to this union.
     pub(crate) fn add_in_place(&mut self, ty: Type<'db>) {
-        ty.assert_not_recursive_var();
         if self.normalization == TypeNormalization::Structural {
             self.add_structural(ty);
             return;
         }
+        ty.assert_not_recursive_var();
         self.add_in_place_impl(ty, &mut vec![]);
     }
 
@@ -1117,7 +1117,7 @@ impl<'db> UnionBuilder<'db> {
         // If an alias gets here, it means we aren't unpacking aliases, and we also
         // shouldn't try to simplify aliases out of the union, because that will require
         // unpacking them.
-        let should_simplify_full = !ty.is_alias_like() && !self.cycle_recovery;
+        let should_simplify_full = !ty.has_alias_name(db) && !self.cycle_recovery;
 
         let mut ty_negated: Option<Type> = None;
         let mut to_remove = SmallVec::<[usize; 2]>::new();
@@ -1198,13 +1198,13 @@ impl<'db> UnionBuilder<'db> {
                 continue;
             }
 
-            if should_simplify_full && !element_type.is_alias_like() {
+            if should_simplify_full && !element_type.has_alias_name(db) {
                 // Preserving aliases also excludes comparisons that expand aliases nested in
                 // type arguments. A recursive alias can rebuild this union during specialization.
                 if !self.unpack_aliases
-                    && [ty, element_type]
-                        .into_iter()
-                        .any(|ty| any_over_type(db, &self.env, ty, false, Type::is_alias_like))
+                    && [ty, element_type].into_iter().any(|ty| {
+                        any_over_type(db, &self.env, ty, false, |ty| ty.has_alias_name(db))
+                    })
                 {
                     continue;
                 }

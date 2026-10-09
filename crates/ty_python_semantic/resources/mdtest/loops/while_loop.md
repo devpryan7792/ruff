@@ -553,7 +553,7 @@ def advance(data: bytes, offset: int) -> None:
             raise ValueError
         offset += step
         # TODO: The offset should retain its `int` type.
-        reveal_type(offset)  # revealed: int | Unknown
+        reveal_type(offset)  # revealed: Unknown | int
 ```
 
 ### Loop updates guarded by compound conditions converge

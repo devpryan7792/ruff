@@ -73,7 +73,7 @@ def alternate(flag: bool):
     value = (1,)
     while flag:
         value = ("a", "b") if len(value) == 1 else (1,)
-    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[Literal["a"], Literal["b"]]
+    reveal_type(value)  # revealed: tuple[Literal["a"], Literal["b"]] | tuple[Literal[1]]
 ```
 
 ## Generic `NamedTuple` with recursive fields
@@ -500,6 +500,52 @@ except Exception:
     result = make
 finally:
     from unknown_module import member as result  # error: [unresolved-import]
+```
+
+## Recursive decorator results in loop conditions
+
+A decorator can return a container that includes the decorated definition. We preserve that outer
+container when the name also has a later type-alias binding.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+@lambda fn: (make,)
+def make(): ...
+
+@lambda cls: make
+class Result: ...
+
+while Result:  # error: [redundant-condition]
+    reveal_type(Result)  # revealed: tuple[Divergent]
+
+type make = int
+```
+
+## Recursive decorator results through a Boolean expression
+
+A decorator can depend on a Boolean expression that reads the decorated class. Inference converges
+and reports the undefined operand.
+
+```py
+@lambda cls: value
+class C: ...
+
+value = C and missing  # error: [unresolved-reference]
+```
+
+## Recursive decorator results through a named expression
+
+The same cycle can pass through a named expression.
+
+```py
+@lambda cls: value
+class C: ...
+
+(value := C and missing)  # error: [unresolved-reference]
 ```
 
 ## Decorated methods with implicit class attributes

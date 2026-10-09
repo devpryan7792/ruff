@@ -297,23 +297,14 @@ impl<'db> UnionType<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
-        if type_mapping.is_structural() {
-            Type::Union(UnionType::new(
-                db,
-                self.elements(db)
-                    .iter()
-                    .map(|element| element.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
-                    .collect::<Box<[_]>>(),
-                self.recursively_defined(db),
-            ))
+        let normalization = if type_mapping.is_structural() {
+            TypeNormalization::Structural
         } else {
-            self.map_leave_aliases_with_normalization(
-                db,
-                visitor.env,
-                visitor.normalization,
-                |element| element.apply_type_mapping_impl(db, type_mapping, tcx, visitor),
-            )
-        }
+            visitor.normalization
+        };
+        self.map_leave_aliases_with_normalization(db, visitor.env, normalization, |element| {
+            element.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
+        })
     }
 
     /// Apply a transformation function to all elements of the union,
@@ -839,38 +830,6 @@ impl<'db> NegativeIntersectionElements<'db> {
             Self::Multiple(set) => set.swap_remove_index(index),
         }
     }
-
-    /// Apply a transformation to all elements in this collection,
-    /// and return a new collection of the transformed elements.
-    fn map(&self, map_fn: impl Fn(&Type<'db>) -> Type<'db>) -> Self {
-        match self {
-            NegativeIntersectionElements::Empty => NegativeIntersectionElements::Empty,
-            NegativeIntersectionElements::Single(ty) => {
-                NegativeIntersectionElements::Single(map_fn(ty))
-            }
-            NegativeIntersectionElements::Multiple(set) => {
-                NegativeIntersectionElements::Multiple(set.iter().map(map_fn).collect())
-            }
-        }
-    }
-
-    /// Apply a fallible transformation to all elements in this collection,
-    /// and return a new collection of the transformed elements.
-    ///
-    /// Returns `None` if `map_fn` fails for any element in the collection.
-    fn try_map(&self, map_fn: impl Fn(&Type<'db>) -> Option<Type<'db>>) -> Option<Self> {
-        match self {
-            NegativeIntersectionElements::Empty => Some(NegativeIntersectionElements::Empty),
-            NegativeIntersectionElements::Single(ty) => {
-                map_fn(ty).map(NegativeIntersectionElements::Single)
-            }
-            NegativeIntersectionElements::Multiple(set) => {
-                Some(NegativeIntersectionElements::Multiple(
-                    set.iter().map(map_fn).collect::<Option<_>>()?,
-                ))
-            }
-        }
-    }
 }
 
 impl<'a, 'db> IntoIterator for &'a NegativeIntersectionElements<'db> {
@@ -1064,33 +1023,24 @@ impl<'db> IntersectionType<'db> {
         env: &ProgramEnvironment<'db>,
         div: Type<'db>,
         nested: bool,
-    ) -> Option<Self> {
-        let positive = if nested {
-            self.positive(db)
-                .iter()
-                .map(|ty| ty.recursive_type_normalized_impl(db, env, div, nested))
-                .collect::<Option<FxOrderSet<Type<'db>>>>()?
-        } else {
-            self.positive(db)
-                .iter()
-                .map(|ty| {
-                    ty.recursive_type_normalized_impl(db, env, div, nested)
-                        .unwrap_or(div)
-                })
-                .collect()
+    ) -> Option<Type<'db>> {
+        let mut builder =
+            IntersectionBuilder::new(db, env).normalization(TypeNormalization::Structural);
+        let normalize = |ty: Type<'db>| {
+            let normalized = ty.recursive_type_normalized_impl(db, env, div, nested);
+            if nested {
+                normalized
+            } else {
+                Some(normalized.unwrap_or(div))
+            }
         };
-
-        let negative = if nested {
-            self.negative(db)
-                .try_map(|ty| ty.recursive_type_normalized_impl(db, env, div, nested))?
-        } else {
-            self.negative(db).map(|ty| {
-                ty.recursive_type_normalized_impl(db, env, div, nested)
-                    .unwrap_or(div)
-            })
-        };
-
-        Some(IntersectionType::new(db, positive, negative))
+        for positive in self.positive(db) {
+            builder.add_positive_in_place(normalize(*positive)?);
+        }
+        for negative in self.negative(db) {
+            builder.add_negative_in_place(normalize(*negative)?);
+        }
+        Some(builder.build())
     }
 
     /// Returns an iterator over the positive elements of the intersection. If
@@ -1115,50 +1065,36 @@ impl<'db> IntersectionType<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
-        if type_mapping.is_structural() {
-            let positive = self
-                .positive(db)
-                .iter()
-                .map(|positive| positive.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
-                .collect::<FxOrderSet<_>>();
-            let mut negative = NegativeIntersectionElements::default();
-            for element in self.negative(db) {
-                negative.insert(element.apply_type_mapping_impl(
+        let normalization = if type_mapping.is_structural() {
+            TypeNormalization::Structural
+        } else {
+            visitor.normalization
+        };
+        let mut builder = IntersectionBuilder::new(db, visitor.env).normalization(normalization);
+        for positive in self.positive(db) {
+            builder.add_positive_in_place(positive.apply_type_mapping_impl(
+                db,
+                type_mapping,
+                tcx,
+                visitor,
+            ));
+        }
+        // Regular promotion should remove negative contributions from intersections,
+        // so we don't preserve them here when regular promotion is enabled.
+        if !matches!(
+            type_mapping,
+            TypeMapping::Promote(PromotionMode::On, PromotionKind::Regular)
+        ) {
+            for negative in self.negative(db) {
+                builder.add_negative_in_place(negative.apply_type_mapping_impl(
                     db,
                     &type_mapping.flip(),
                     tcx,
                     visitor,
                 ));
             }
-            Type::Intersection(IntersectionType::new(db, positive, negative))
-        } else {
-            let mut builder =
-                IntersectionBuilder::new(db, visitor.env).normalization(visitor.normalization);
-            for positive in self.positive(db) {
-                builder.add_positive_in_place(positive.apply_type_mapping_impl(
-                    db,
-                    type_mapping,
-                    tcx,
-                    visitor,
-                ));
-            }
-            // Regular promotion should remove negative contributions from intersections,
-            // so we don't preserve them here when regular promotion is enabled.
-            if !matches!(
-                type_mapping,
-                TypeMapping::Promote(PromotionMode::On, PromotionKind::Regular)
-            ) {
-                for negative in self.negative(db) {
-                    builder.add_negative_in_place(negative.apply_type_mapping_impl(
-                        db,
-                        &type_mapping.flip(),
-                        tcx,
-                        visitor,
-                    ));
-                }
-            }
-            builder.build()
         }
+        builder.build()
     }
 
     /// Map a type transformation over all positive elements of the intersection. Leave the

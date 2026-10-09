@@ -34,6 +34,7 @@ use ty_python_core::definition::Definition;
 
 use crate::types::function::FunctionLiteral;
 use crate::types::generics::{GenericContext, Specialization};
+use crate::types::recursive::{RecursiveCycle, RecursiveDefinitionIdentity};
 use crate::types::visitor::{TypeCollector, TypeVisitor, walk_type_with_recursion_guard};
 use crate::types::{
     BoundTypeVarIdentity, BoundTypeVarInstance, ProtocolInstanceType, RecursiveType,
@@ -49,7 +50,7 @@ pub enum TypeIdentity<'db> {
     GrowingProtocol(Definition<'db>),
     GrowingTypeAlias(Definition<'db>),
     GrowingTypedDict(Definition<'db>),
-    GrowingRecursive(Definition<'db>),
+    GrowingRecursive(RecursiveCycle),
     Other(Type<'db>),
 }
 
@@ -77,7 +78,7 @@ impl<'db> Type<'db> {
             }
             (Type::TypeAlias(a), Type::TypeAlias(b)) => a.definition(db) == b.definition(db),
             (Type::TypedDict(a), Type::TypedDict(b)) => a.definition(db) == b.definition(db),
-            (Type::Recursive(a), Type::Recursive(b)) => a.definition(db) == b.definition(db),
+            (Type::Recursive(a), Type::Recursive(b)) => a.cycle(db) == b.cycle(db),
             _ => false,
         }
     }
@@ -108,13 +109,18 @@ impl<'db> Type<'db> {
                 if !target.may_have_unbounded_specialization(db) {
                     return None;
                 }
-                let definition = target.definition(db);
                 Some(match target {
-                    RecursiveDefinition::TypeAlias(_) => TypeIdentity::GrowingTypeAlias(definition),
-                    RecursiveDefinition::Protocol(_) => TypeIdentity::GrowingProtocol(definition),
-                    RecursiveDefinition::TypedDict(_) => TypeIdentity::GrowingTypedDict(definition),
-                    RecursiveDefinition::Structural(_) => {
-                        TypeIdentity::GrowingRecursive(definition)
+                    RecursiveDefinition::TypeAlias(alias) => {
+                        TypeIdentity::GrowingTypeAlias(alias.definition(db))
+                    }
+                    RecursiveDefinition::Protocol(origin) => {
+                        TypeIdentity::GrowingProtocol(origin.definition(db))
+                    }
+                    RecursiveDefinition::TypedDict(origin) => {
+                        TypeIdentity::GrowingTypedDict(origin.definition(db))
+                    }
+                    RecursiveDefinition::Structural(recursive) => {
+                        TypeIdentity::GrowingRecursive(recursive.cycle(db))
                     }
                 })
             }
@@ -216,9 +222,12 @@ struct DefinitionUse<'db> {
 struct SpecializationFlowGraph<'db> {
     edges: FxHashSet<FlowEdge<'db>>,
     /// Definition references used to decide whether an unresolved flow can return to the root.
-    definition_edges: Vec<(Definition<'db>, Definition<'db>)>,
+    definition_edges: Vec<(
+        RecursiveDefinitionIdentity<'db>,
+        RecursiveDefinitionIdentity<'db>,
+    )>,
     /// Definitions whose captured outer parameters cannot be mapped to their parent specialization.
-    inconclusive_definitions: FxHashSet<Definition<'db>>,
+    inconclusive_definitions: FxHashSet<RecursiveDefinitionIdentity<'db>>,
     /// Whether a definition body or its formal parameters could not be inspected.
     inconclusive: bool,
 }
@@ -284,11 +293,23 @@ impl<'db> RecursiveDefinition<'db> {
         })
     }
 
-    fn definition(self, db: &'db dyn Db) -> Definition<'db> {
+    fn identity(self, db: &'db dyn Db) -> RecursiveDefinitionIdentity<'db> {
         match self {
-            Self::TypeAlias(alias) => alias.definition(db),
-            Self::Structural(recursive) => recursive.definition(db),
-            Self::Protocol(origin) | Self::TypedDict(origin) => origin.definition(db),
+            Self::TypeAlias(alias) => RecursiveDefinitionIdentity::Definition(alias.definition(db)),
+            Self::Structural(recursive) => recursive.definition_identity(db),
+            Self::Protocol(origin) | Self::TypedDict(origin) => {
+                RecursiveDefinitionIdentity::Definition(origin.definition(db))
+            }
+        }
+    }
+
+    fn environment(self, db: &'db dyn Db) -> ProgramEnvironment<'db> {
+        match self {
+            Self::TypeAlias(alias) => ProgramEnvironment::from_definition(alias.definition(db)),
+            Self::Structural(recursive) => recursive.environment(db),
+            Self::Protocol(origin) | Self::TypedDict(origin) => {
+                ProgramEnvironment::from_definition(origin.definition(db))
+            }
         }
     }
 
@@ -380,7 +401,7 @@ impl<'db> SpecializationFlowGraph<'db> {
         let mut visited = FxHashSet::default();
 
         while let Some(source) = pending.pop() {
-            let source_definition = source.definition(db);
+            let source_definition = source.identity(db);
             if !visited.insert(source_definition) {
                 continue;
             }
@@ -399,7 +420,7 @@ impl<'db> SpecializationFlowGraph<'db> {
             graph.definition_edges.extend(
                 referenced_definitions
                     .iter()
-                    .map(|target| (source_definition, target.definition(db))),
+                    .map(|target| (source_definition, target.identity(db))),
             );
             pending.extend(referenced_definitions);
         }
@@ -415,7 +436,7 @@ impl<'db> SpecializationFlowGraph<'db> {
             return true;
         }
 
-        let root_definition = root.definition(db);
+        let root_definition = root.identity(db);
         if self.inconclusive_definition_reaches(root_definition) {
             return true;
         }
@@ -521,7 +542,7 @@ impl<'db> SpecializationFlowGraph<'db> {
         components
     }
 
-    fn inconclusive_definition_reaches(&self, target: Definition<'db>) -> bool {
+    fn inconclusive_definition_reaches(&self, target: RecursiveDefinitionIdentity<'db>) -> bool {
         if self.inconclusive_definitions.is_empty() {
             return false;
         }
@@ -532,8 +553,14 @@ impl<'db> SpecializationFlowGraph<'db> {
             .is_disjoint(&definitions_reaching_target)
     }
 
-    fn definitions_reaching(&self, target: Definition<'db>) -> FxHashSet<Definition<'db>> {
-        let mut incoming = FxHashMap::<Definition, SmallVec<[Definition; 2]>>::default();
+    fn definitions_reaching(
+        &self,
+        target: RecursiveDefinitionIdentity<'db>,
+    ) -> FxHashSet<RecursiveDefinitionIdentity<'db>> {
+        let mut incoming = FxHashMap::<
+            RecursiveDefinitionIdentity,
+            SmallVec<[RecursiveDefinitionIdentity; 2]>,
+        >::default();
         for &(source, target) in &self.definition_edges {
             incoming.entry(target).or_default().push(source);
         }
@@ -562,7 +589,7 @@ impl<'db> SpecializationFlowVisitor<'db> {
     fn new(db: &'db dyn Db, source: RecursiveDefinition<'db>) -> Option<Self> {
         Some(Self {
             source_parameters: source.source_parameters(db)?,
-            env: ProgramEnvironment::from_definition(source.definition(db)),
+            env: source.environment(db),
             visited_types: TypeCollector::default(),
             edges: RefCell::default(),
             referenced_definitions: RefCell::default(),
@@ -788,8 +815,8 @@ impl<'db> TypeAliasType<'db> {
         ) -> bool {
             let root = RecursiveDefinition::TypeAlias(alias);
             SpecializationFlowGraph::build(db, root)
-                .definitions_reaching(definition)
-                .contains(&definition)
+                .definitions_reaching(RecursiveDefinitionIdentity::Definition(definition))
+                .contains(&RecursiveDefinitionIdentity::Definition(definition))
         }
         has_recursive_definition(db, self.definition(db), self.unspecialized(db))
     }

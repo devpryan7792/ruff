@@ -19,7 +19,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use ty_module_resolver::file_to_module;
 
-use crate::Db;
 use crate::place::{DefinedPlace, Place};
 use crate::types::callable::CallableTypeKind;
 use crate::types::class::{ClassLiteral, ClassType, GenericAlias};
@@ -31,7 +30,7 @@ use crate::types::signatures::{Parameter, Parameters, ParametersKind, Signature}
 use crate::types::tuple::{TupleSpec, VariableSegment};
 use crate::types::type_alias::QualifiedTypeAliasName;
 use crate::types::typevar::BoundTypeVarIdentity;
-use crate::types::visitor::TypeVisitor;
+use crate::types::visitor::{TypeVisitor, any_over_type};
 use crate::types::{
     CallableType, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
     KnownUnion, LiteralValueType, LiteralValueTypeKind, MaterializationKind, PropertyInstanceClass,
@@ -39,6 +38,7 @@ use crate::types::{
     TypeAliasType, TypeGuardLike, TypedDictType, TypingModule, UnionType, WrapperDescriptorKind,
     visitor,
 };
+use crate::{Db, FxOrderSet};
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::{FileScopeId, ScopeKind};
@@ -56,7 +56,7 @@ const MAX_SIGNATURE_DISPLAY_DEPTH: usize = 4;
 enum NamedItem<'db> {
     Class(ClassLiteral<'db>),
     TypeAlias(TypeAliasType<'db>),
-    Recursive(RecursiveType<'db>),
+    Recursive(Definition<'db>, &'db str),
 }
 
 impl<'db> NamedItem<'db> {
@@ -67,9 +67,7 @@ impl<'db> NamedItem<'db> {
                 // Specializations of the same alias share a display name.
                 left.definition(db) == right.definition(db)
             }
-            (NamedItem::Recursive(left), NamedItem::Recursive(right)) => {
-                left.definition(db) == right.definition(db)
-            }
+            (NamedItem::Recursive(left, _), NamedItem::Recursive(right, _)) => left == right,
             _ => false,
         }
     }
@@ -78,7 +76,7 @@ impl<'db> NamedItem<'db> {
         match self {
             NamedItem::Class(class) => class.name(db),
             NamedItem::TypeAlias(type_alias) => type_alias.name(db),
-            NamedItem::Recursive(recursive) => recursive.name(db),
+            NamedItem::Recursive(_, name) => name,
         }
     }
 
@@ -88,9 +86,8 @@ impl<'db> NamedItem<'db> {
             NamedItem::TypeAlias(type_alias) => {
                 type_alias.qualified_name(db).components_excluding_self()
             }
-            NamedItem::Recursive(recursive) => {
-                QualifiedTypeAliasName::new(db, recursive.definition(db), recursive.name(db))
-                    .components_excluding_self()
+            NamedItem::Recursive(definition, name) => {
+                QualifiedTypeAliasName::new(db, definition, name).components_excluding_self()
             }
         }
     }
@@ -156,6 +153,7 @@ pub struct DisplaySettings<'db> {
     visited_callable_types: Rc<FxHashSet<CallableType<'db>>>,
     /// Alias views can expose the same declaration under changed arguments.
     visited_type_aliases: Rc<FxHashSet<Definition<'db>>>,
+    visited_recursive_types: Rc<FxHashSet<RecursiveType<'db>>>,
     /// Whether to hide the return type of the outermost signature.
     /// Return types of nested callable types inside parameters are still shown.
     hide_return_type: bool,
@@ -691,7 +689,9 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
                 self.record_class(db, ClassLiteral::Static(alias.origin(db)));
             }
             Type::TypeAlias(type_alias) => self.record_type_alias(db, type_alias),
-            Type::Recursive(recursive) => self.record(db, NamedItem::Recursive(recursive)),
+            Type::Recursive(recursive) if let Some((definition, name)) = recursive.alias(db) => {
+                self.record(db, NamedItem::Recursive(definition, name));
+            }
             // Visit the class (as if it were a nominal-instance type)
             // rather than the protocol members, if it is a class-based protocol.
             // (For the purposes of displaying the type, we'll use the class name.)
@@ -713,6 +713,12 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
     }
 
     fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
+        if recursive.inferred(db) {
+            if let Some(unfolded) = recursive.unfold(db, self.env).into_unfolded() {
+                self.visit_type(db, unfolded);
+            }
+            return;
+        }
         // Only the alias name and its arguments are displayed, not its unfolded body.
         if let Some(arguments) = recursive.arguments(db) {
             walk_specialization_types(db, arguments, self);
@@ -1899,19 +1905,34 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'_, 'db> {
                     alias.materialization_kind(db),
                     f,
                 ),
-            Type::Recursive(recursive) => TypeAliasDisplay {
-                db,
-                ty: self.ty,
-                definition: recursive.definition(db),
-                name: recursive.name(db),
-                settings: self.settings.clone(),
+            Type::Recursive(recursive) if let Some((definition, name)) = recursive.alias(db) => {
+                TypeAliasDisplay {
+                    db,
+                    ty: self.ty,
+                    definition,
+                    name,
+                    settings: self.settings.clone(),
+                }
+                .fmt_specialized(
+                    self.env,
+                    recursive.arguments(db),
+                    recursive.materialization_kind(db),
+                    f,
+                )
             }
-            .fmt_specialized(
-                self.env,
-                recursive.arguments(db),
-                recursive.materialization_kind(db),
-                f,
-            ),
+            Type::Recursive(recursive) => {
+                if self.settings.visited_recursive_types.contains(&recursive) {
+                    return f.write_str("Divergent");
+                }
+                let mut settings = self.settings.clone();
+                Rc::make_mut(&mut settings.visited_recursive_types).insert(recursive);
+                recursive
+                    .unfold(db, self.env)
+                    .into_unfolded()
+                    .unwrap_or_else(Type::unknown)
+                    .display_with(db, self.env, settings)
+                    .fmt_detailed(f)
+            }
             Type::NewTypeInstance(newtype) => f.with_type(self.ty).write_str(newtype.name(db)),
         }
     }
@@ -3310,31 +3331,35 @@ enum UnionDisplayEntry<'db> {
 
 impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
     fn fmt_detailed(&self, f: &mut TypeWriter<'_, '_, 'db>) -> fmt::Result {
-        fn duplicate_ambiguous_labels<'a, 'db>(
-            displayed: &'a [UnionDisplayEntry<'db>],
-            omitted: impl Iterator<Item = UnionDisplayEntry<'db>>,
-        ) -> FxHashSet<&'a str> {
+        fn duplicate_ambiguous_labels(displayed: &[UnionDisplayEntry<'_>]) -> FxHashSet<String> {
             let mut counts: FxHashMap<&str, usize> = FxHashMap::default();
             for entry in displayed {
                 if let UnionDisplayEntry::Type(_, display) = entry {
                     *counts.entry(display.label()).or_default() += 1;
                 }
             }
-            for entry in omitted {
-                if let UnionDisplayEntry::Type(_, display) = entry
-                    && let Some(count) = counts.get_mut(display.label())
-                {
-                    *count += 1;
-                }
-            }
             counts
                 .into_iter()
-                .filter_map(|(label, count)| (count > 1).then_some(label))
+                .filter(|(_, count)| *count > 1)
+                .map(|(label, _)| label.to_owned())
                 .collect()
         }
         let db = self.db;
 
-        let elements = self.ty.elements(db);
+        let mut pending: Vec<_> = self.ty.elements(db).iter().rev().copied().collect();
+        let mut seen = FxHashSet::default();
+        let mut elements = FxOrderSet::default();
+        while let Some(element) = pending.pop() {
+            if !seen.insert(element) {
+                continue;
+            }
+            match element.resolve_inferred_type(db) {
+                Type::Union(union) => pending.extend(union.elements(db).iter().rev().copied()),
+                element => {
+                    elements.insert(element);
+                }
+            }
+        }
         let numeric_tower = matches!(
             self.settings.numeric_tower_display,
             NumericTowerDisplay::Canonical
@@ -3356,15 +3381,12 @@ impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
             })
         };
         let mut condensed_types = vec![];
-        let mut condensed_element_count = 0usize;
         let mut subclass_of_types = vec![];
-        let mut numeric_tower_element_count = 0usize;
 
         for element in elements.iter().copied() {
             if is_numeric_tower_element(element) {
-                numeric_tower_element_count += 1;
+                continue;
             } else if let Some(literals) = self.condensable_literals(element) {
-                condensed_element_count += 1;
                 for literal in literals {
                     if !condensed_types.contains(&literal) {
                         condensed_types.push(literal);
@@ -3375,95 +3397,95 @@ impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
             }
         }
 
-        let total_entries = elements.len()
-            - numeric_tower_element_count
-            - condensed_element_count
-            - subclass_of_types.len()
-            + usize::from(numeric_tower.is_some())
-            + usize::from(!condensed_types.is_empty())
-            + usize::from(!subclass_of_types.is_empty());
-        assert_ne!(total_entries, 0);
-        let display_limit =
-            UNION_POLICY.display_limit(total_entries, self.settings.preserve_full_unions);
-
         let mut numeric_tower = numeric_tower;
         let mut condensed_types = Some(condensed_types);
         let mut subclass_of_types = Some(subclass_of_types);
-        let mut entry_index = 0;
-        let mut entries = elements.iter().copied().filter_map(|element| {
-            let entry = if is_numeric_tower_element(element) {
-                UnionDisplayEntry::NumericTower(numeric_tower.take()?)
-            } else if self.condensable_literals(element).is_some() {
-                UnionDisplayEntry::Literals(condensed_types.take()?)
-            } else if element.is_subclass_of() {
-                UnionDisplayEntry::Subclasses(subclass_of_types.take()?)
-            } else {
-                let display = DisplayMaybeParenthesizedType {
-                    ty: element,
-                    db,
-                    env: self.env,
-                    settings: self.settings.singleline(),
-                };
-                let display = if entry_index < display_limit {
-                    f.render(&display)
+        let entries: Vec<_> = elements
+            .iter()
+            .copied()
+            .filter_map(|element| {
+                let entry = if is_numeric_tower_element(element) {
+                    UnionDisplayEntry::NumericTower(numeric_tower.take()?)
+                } else if self.condensable_literals(element).is_some() {
+                    UnionDisplayEntry::Literals(condensed_types.take()?)
+                } else if element.is_subclass_of() {
+                    UnionDisplayEntry::Subclasses(subclass_of_types.take()?)
                 } else {
-                    // Omitted entries still participate in name disambiguation, but their
-                    // navigation metadata is never emitted.
-                    BufferedTypeDisplay::Text(display.to_string())
+                    let display = DisplayMaybeParenthesizedType {
+                        ty: element,
+                        db,
+                        env: self.env,
+                        settings: self.settings.singleline(),
+                    };
+                    let display = f.render(&display);
+                    UnionDisplayEntry::Type(element, display)
                 };
-                UnionDisplayEntry::Type(element, display)
-            };
-            entry_index += 1;
-            Some(entry)
-        });
-        let displayed: Vec<_> = entries.by_ref().take(display_limit).collect();
-        // Only displayed labels need counts; omitted labels can be discarded after comparison.
-        let duplicate_ambiguous_labels = duplicate_ambiguous_labels(&displayed, entries);
-        let mut join = f.join(" | ");
-
-        for entry in &displayed {
-            match entry {
-                UnionDisplayEntry::NumericTower(union) => {
-                    join.entry(&DisplayKnownUnion {
-                        union: *union,
-                        db,
-                        env: self.env,
-                        settings: self.settings.singleline(),
-                    });
-                }
-                UnionDisplayEntry::Literals(literals) => {
-                    join.entry(&DisplayLiteralGroup {
-                        literals,
-                        db,
-                        env: self.env,
-                        settings: self.settings.singleline(),
-                    });
-                }
-                UnionDisplayEntry::Subclasses(types) => {
-                    join.entry(&DisplaySubclassOfGroup {
-                        types,
-                        db,
-                        env: self.env,
-                        settings: self.settings.singleline(),
-                    });
-                }
-                UnionDisplayEntry::Type(element, display) => {
-                    if duplicate_ambiguous_labels.contains(display.label())
-                        && self.settings.signature_name_display != SignatureNameDisplay::Force
-                    {
-                        join.entry(&DisplayMaybeParenthesizedType {
-                            ty: *element,
-                            db,
-                            env: self.env,
-                            settings: self.settings.singleline().force_signature_name(),
-                        });
-                    } else {
-                        // Rendering again at each union would double the work for each
-                        // level of nesting. Preserve the buffered navigation ranges too.
-                        join.entry(display);
+                Some(entry)
+            })
+            .collect();
+        let duplicate_ambiguous_labels = duplicate_ambiguous_labels(&entries);
+        let rendered: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let has_cycle_marker = match &entry {
+                    UnionDisplayEntry::Type(ty, _) => {
+                        any_over_type(db, self.env, *ty, false, |ty| ty.is_divergent())
                     }
-                }
-            }
+                    _ => false,
+                };
+                let display = match entry {
+                    UnionDisplayEntry::NumericTower(union) => f.render(&DisplayKnownUnion {
+                        union,
+                        db,
+                        env: self.env,
+                        settings: self.settings.singleline(),
+                    }),
+                    UnionDisplayEntry::Literals(literals) => f.render(&DisplayLiteralGroup {
+                        literals: &literals,
+                        db,
+                        env: self.env,
+                        settings: self.settings.singleline(),
+                    }),
+                    UnionDisplayEntry::Subclasses(types) => f.render(&DisplaySubclassOfGroup {
+                        types: &types,
+                        db,
+                        env: self.env,
+                        settings: self.settings.singleline(),
+                    }),
+                    UnionDisplayEntry::Type(element, display) => {
+                        if duplicate_ambiguous_labels.contains(display.label())
+                            && self.settings.signature_name_display != SignatureNameDisplay::Force
+                        {
+                            f.render(&DisplayMaybeParenthesizedType {
+                                ty: element,
+                                db,
+                                env: self.env,
+                                settings: self.settings.singleline().force_signature_name(),
+                            })
+                        } else {
+                            display
+                        }
+                    }
+                };
+                (display, has_cycle_marker)
+            })
+            .collect();
+        let mut labels = FxHashSet::default();
+        // Cycle markers carry distinct query identities during inference. A diagnostic can
+        // show each unresolved shape once while those identities remain intact in the types.
+        let rendered: Vec<_> = rendered
+            .into_iter()
+            .filter(|(display, has_cycle_marker)| {
+                !has_cycle_marker || labels.insert(display.label().to_owned())
+            })
+            .map(|(display, _)| display)
+            .collect();
+        let total_entries = rendered.len();
+        let display_limit =
+            UNION_POLICY.display_limit(total_entries, self.settings.preserve_full_unions);
+        let mut join = f.join(" | ");
+        for display in rendered.iter().take(display_limit) {
+            join.entry(display);
         }
 
         if !self.settings.preserve_full_unions {
@@ -3501,6 +3523,12 @@ impl<'db> FmtDetailed<'db> for DisplayKnownUnion<'_, 'db> {
             f.with_type(class.to_instance(self.db, self.env))
                 .write_str(class.name(self.env.python_version(self.db)))
         }
+    }
+}
+
+impl Display for DisplayKnownUnion<'_, '_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.fmt_detailed(&mut TypeWriter::Formatter(f))
     }
 }
 
@@ -4084,7 +4112,8 @@ impl<'db> FmtDetailed<'db> for DisplayKnownInstanceRepr<'_, 'db> {
                 f.write_str(" special-form")?;
                 if let Ok(ty) = union.union_type(db) {
                     f.write_str(" '")?;
-                    ty.display(db, self.env).fmt_detailed(f)?;
+                    ty.display_with(db, self.env, self.settings.clone())
+                        .fmt_detailed(f)?;
                     f.write_char('\'')?;
                 }
                 f.write_char('>')
@@ -4092,7 +4121,10 @@ impl<'db> FmtDetailed<'db> for DisplayKnownInstanceRepr<'_, 'db> {
             KnownInstanceType::Literal(inner) => {
                 f.set_invalid_type_annotation();
                 f.write_str("<special-form '")?;
-                inner.inner(db).display(db, self.env).fmt_detailed(f)?;
+                inner
+                    .inner(db)
+                    .display_with(db, self.env, self.settings.clone())
+                    .fmt_detailed(f)?;
                 f.write_str("'>")
             }
             KnownInstanceType::Annotated(inner) => {
@@ -4101,7 +4133,10 @@ impl<'db> FmtDetailed<'db> for DisplayKnownInstanceRepr<'_, 'db> {
                 f.with_type(Type::SpecialForm(SpecialFormType::Annotated))
                     .write_str("typing.Annotated")?;
                 f.write_char('[')?;
-                inner.inner(db).display(db, self.env).fmt_detailed(f)?;
+                inner
+                    .inner(db)
+                    .display_with(db, self.env, self.settings.clone())
+                    .fmt_detailed(f)?;
                 f.write_str(", <metadata>]'>")
             }
             KnownInstanceType::Callable(callable) => {
@@ -4125,7 +4160,10 @@ impl<'db> FmtDetailed<'db> for DisplayKnownInstanceRepr<'_, 'db> {
                 f.with_type(KnownClass::Type.to_class_literal(db, self.env))
                     .write_str("type")?;
                 f.write_char('[')?;
-                inner.inner(db).display(db, self.env).fmt_detailed(f)?;
+                inner
+                    .inner(db)
+                    .display_with(db, self.env, self.settings.clone())
+                    .fmt_detailed(f)?;
                 f.write_str("]'>")
             }
             KnownInstanceType::LiteralStringAlias(_) => f
@@ -4161,7 +4199,10 @@ impl<'db> FmtDetailed<'db> for DisplayKnownInstanceRepr<'_, 'db> {
                 f.set_invalid_type_annotation();
                 f.write_str(wrapper.class(db).name(self.env.python_version(db)))?;
                 f.write_char('[')?;
-                wrapper.wrapped(db).display(db, self.env).fmt_detailed(f)?;
+                wrapper
+                    .wrapped(db)
+                    .display_with(db, self.env, self.settings.clone())
+                    .fmt_detailed(f)?;
                 f.write_char(']')
             }
         }
