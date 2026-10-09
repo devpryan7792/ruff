@@ -205,7 +205,7 @@ impl<'db> RecursiveSpecialization<'db> {
         }
     }
 
-    fn visit_types(&self, db: &'db dyn Db, visitor: &impl TypeVisitor<'db>) {
+    fn visit_types(&self, db: &'db dyn Db, visitor: &(impl TypeVisitor<'db> + ?Sized)) {
         match &self.base {
             RecursiveSpecializationBase::Specialization { specialization, .. }
             | RecursiveSpecializationBase::TypeAlias(specialization) => {
@@ -293,6 +293,10 @@ pub enum RecursiveOperation<'db> {
         Option<BindingContext<'db>>,
     ),
     ReplaceSelf(Type<'db>),
+    Promote(super::PromotionMode, super::PromotionKind),
+    ReplaceParameterDefaults,
+    EagerExpansion,
+    RescopeReturnCallables(Box<[(super::CallableType<'db>, super::CallableType<'db>)]>),
 }
 
 impl<'db> RecursiveOperation<'db> {
@@ -321,10 +325,16 @@ impl<'db> RecursiveOperation<'db> {
         })
     }
 
-    fn visit_types(&self, db: &'db dyn Db, visitor: &impl TypeVisitor<'db>) {
+    pub(super) fn visit_types(&self, db: &'db dyn Db, visitor: &(impl TypeVisitor<'db> + ?Sized)) {
         match self {
             Self::Specialize(specialization, _) => specialization.visit_types(db, visitor),
             Self::BindSelf(ty, ..) | Self::ReplaceSelf(ty) => visitor.visit_type(db, *ty),
+            Self::RescopeReturnCallables(callables) => {
+                for &(source, target) in callables {
+                    visitor.visit_type(db, Type::Callable(source));
+                    visitor.visit_type(db, Type::Callable(target));
+                }
+            }
             _ => {}
         }
     }
@@ -358,6 +368,13 @@ impl<'db> RecursiveOperation<'db> {
             Self::ReplaceSelf(new_upper_bound) => f(TypeMapping::ReplaceSelf {
                 new_upper_bound: *new_upper_bound,
             }),
+            Self::Promote(mode, kind) => f(TypeMapping::Promote(*mode, *kind)),
+            Self::ReplaceParameterDefaults => f(TypeMapping::ReplaceParameterDefaults),
+            Self::EagerExpansion => f(TypeMapping::EagerExpansion),
+            Self::RescopeReturnCallables(callables) => {
+                let callables = callables.iter().copied().collect();
+                f(TypeMapping::RescopeReturnCallables(&callables))
+            }
         }
     }
 
@@ -376,6 +393,17 @@ impl<'db> RecursiveOperation<'db> {
             }
             Self::BindSelf(ty, class, context) => Self::BindSelf(map(*ty), *class, *context),
             Self::ReplaceSelf(ty) => Self::ReplaceSelf(map(*ty)),
+            Self::RescopeReturnCallables(callables) => Self::RescopeReturnCallables(
+                callables
+                    .iter()
+                    .map(|&(source, target)| {
+                        (
+                            map(Type::Callable(source)).as_callable().unwrap_or(source),
+                            map(Type::Callable(target)).as_callable().unwrap_or(target),
+                        )
+                    })
+                    .collect(),
+            ),
             operation => operation.clone(),
         }
     }
@@ -886,7 +914,8 @@ impl<'db> RecursiveType<'db> {
     /// type can still contain recursive references, so callers must retain their recursion guards.
     pub fn unfold(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> UnfoldResult<'db> {
         let base = self.with_operations(db, Box::<[RecursiveOperation<'_>]>::default());
-        let unfolded = self.replay_operations(db, env, base.unfolded_body(db));
+        let unfolded = base.unfolded_body(db);
+        let unfolded = self.replay_operations(db, env, unfolded, true, false);
         if unfolded == Type::Recursive(self) {
             UnfoldResult::Unchanged(self)
         } else {
@@ -894,18 +923,36 @@ impl<'db> RecursiveType<'db> {
         }
     }
 
-    /// The unspecialized finite body used to analyze tuple unpack dependencies.
-    pub(super) fn shape_body(self, db: &'db dyn Db) -> Option<Type<'db>> {
+    /// Return the finite expression whose nodes identify observations of an inferred alias.
+    /// Declaration-backed protocols expose members independently instead of an eager body.
+    pub(super) fn observation_body(self, db: &'db dyn Db) -> Option<Type<'db>> {
         match self.body(db) {
             RecursiveBody::Inferred(body) => Some(body),
             RecursiveBody::Protocol(_) => None,
         }
     }
 
-    /// Instantiate one body node with the same environment and operation order as unfolding.
+    /// Instantiate a selected expression without forcing the rest of its declaration.
     pub(super) fn apply_to_node_structural(self, db: &'db dyn Db, node: Type<'db>) -> Type<'db> {
-        let base = self.with_operations(db, Box::<[RecursiveOperation<'_>]>::default());
-        self.replay_operations(db, &self.environment(db), base.close_body_node(db, node))
+        let env = self.environment(db);
+        let base = self.with_operations(db, Box::default());
+        let node = self.close_references(db, &env, node);
+        let node = base.apply_base_arguments(db, &env, node, false, false);
+        self.replay_operations(db, &env, node, false, false)
+    }
+
+    /// Instantiate a selected expression without forcing the rest of its declaration.
+    pub(super) fn observe_body_node(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        node: Type<'db>,
+        contravariant: bool,
+    ) -> Type<'db> {
+        let base = self.with_operations(db, Box::default());
+        let node = self.close_references(db, env, node);
+        let node = base.apply_base_arguments(db, env, node, false, contravariant);
+        self.replay_operations(db, env, node, false, contravariant)
     }
 
     fn replay_operations(
@@ -913,15 +960,24 @@ impl<'db> RecursiveType<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         mut unfolded: Type<'db>,
+        protocol_body: bool,
+        contravariant: bool,
     ) -> Type<'db> {
         for (index, operation) in self.operations(db).iter().enumerate() {
             operation.with_mapping(|mapping| {
+                let mapping = if contravariant {
+                    mapping.flip()
+                } else {
+                    mapping
+                };
                 let mut visitor = ApplyTypeMappingVisitor::new_for_type_construction(env);
                 if let RecursiveOperation::Materialize(_, map_bounds) = operation {
                     visitor.materialize_typevar_bounds_and_defaults = *map_bounds;
                 }
                 unfolded = match unfolded {
-                    Type::ProtocolInstance(protocol) if self.protocol_origin(db).is_some() => {
+                    Type::ProtocolInstance(protocol)
+                        if protocol_body && self.protocol_origin(db).is_some() =>
+                    {
                         // This is the outer body being observed. References captured inside
                         // its members still map through their closed recursive applications.
                         Type::ProtocolInstance(protocol.apply_type_mapping_impl(
@@ -939,14 +995,16 @@ impl<'db> RecursiveType<'db> {
                     ),
                 };
             });
-            if self.protocol_origin(db).is_some()
+            if protocol_body
+                && self.protocol_origin(db).is_some()
                 && let Type::ProtocolInstance(protocol) = unfolded
             {
                 let origin = self.with_operations(db, self.operations(db)[..=index].into());
                 unfolded = Type::ProtocolInstance(protocol.with_recursive_origin(db, origin));
             }
         }
-        if self.protocol_origin(db).is_some()
+        if protocol_body
+            && self.protocol_origin(db).is_some()
             && let Type::ProtocolInstance(protocol) = unfolded
         {
             unfolded = Type::ProtocolInstance(protocol.with_recursive_origin(db, self));
@@ -961,8 +1019,9 @@ impl<'db> RecursiveType<'db> {
         heap_size=ruff_memory_usage::heap_size
     )]
     fn unfolded_body(self, db: &'db dyn Db) -> Type<'db> {
-        let body = match self.body(db) {
-            RecursiveBody::Inferred(body) => body,
+        let env = self.environment(db);
+        let unfolded = match self.body(db) {
+            RecursiveBody::Inferred(body) => self.close_references(db, &env, body),
             RecursiveBody::Protocol(origin) => {
                 let Some(protocol) = origin.identity_specialization(db).into_protocol_class(db)
                 else {
@@ -976,24 +1035,33 @@ impl<'db> RecursiveType<'db> {
                 }
             }
         };
-        self.close_body_node(db, body)
+        self.apply_base_arguments(db, &env, unfolded, true, false)
     }
 
-    fn close_body_node(self, db: &'db dyn Db, node: Type<'db>) -> Type<'db> {
-        let env = self.environment(db);
-        let unfolded = match self.body(db) {
-            RecursiveBody::Inferred(_) => node.apply_type_mapping_impl(
-                db,
-                &TypeMapping::ApplyRecursiveSubstitution(RecursiveMapping(
-                    RecursiveSubstitution::Unfold(
-                        self.with_operations(db, Box::<[RecursiveOperation<'_>]>::default()),
-                    ),
-                )),
-                TypeContext::default(),
-                &ApplyTypeMappingVisitor::new_for_type_construction(&env),
-            ),
-            RecursiveBody::Protocol(_) => node,
-        };
+    fn close_references(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        node: Type<'db>,
+    ) -> Type<'db> {
+        node.apply_type_mapping_impl(
+            db,
+            &TypeMapping::ApplyRecursiveSubstitution(RecursiveMapping(
+                RecursiveSubstitution::Unfold(self.with_operations(db, Box::default())),
+            )),
+            TypeContext::default(),
+            &ApplyTypeMappingVisitor::new_for_type_construction(env),
+        )
+    }
+
+    fn apply_base_arguments(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        unfolded: Type<'db>,
+        protocol_body: bool,
+        contravariant: bool,
+    ) -> Type<'db> {
         let protocol_origin = self.protocol_origin(db);
         let unfolded = match self.base_arguments(db) {
             Some(arguments) => {
@@ -1020,9 +1088,16 @@ impl<'db> RecursiveType<'db> {
                     }
                     None => TypeMapping::ApplySpecialization(specialization),
                 };
-                let visitor = ApplyTypeMappingVisitor::new_for_type_construction(&env);
+                let mapping = if contravariant {
+                    mapping.flip()
+                } else {
+                    mapping
+                };
+                let visitor = ApplyTypeMappingVisitor::new_for_type_construction(env);
                 match unfolded {
-                    Type::ProtocolInstance(protocol) if protocol_origin.is_some() => {
+                    Type::ProtocolInstance(protocol)
+                        if protocol_body && protocol_origin.is_some() =>
+                    {
                         Type::ProtocolInstance(protocol.apply_type_mapping_impl(
                             db,
                             &mapping,
@@ -1040,7 +1115,9 @@ impl<'db> RecursiveType<'db> {
             }
             None => unfolded,
         };
-        if let (Type::ProtocolInstance(protocol), Some(origin)) = (unfolded, protocol_origin) {
+        if protocol_body
+            && let (Type::ProtocolInstance(protocol), Some(origin)) = (unfolded, protocol_origin)
+        {
             Type::ProtocolInstance(
                 ProtocolInstanceType::from_interface(db, origin, protocol.interface(db).base())
                     .with_recursive_origin(db, self),
@@ -1459,7 +1536,11 @@ impl<'db> VarianceInferable<'db> for RecursiveType<'db> {
 /// Prove that materialization leaves the stored structure unchanged without unfolding a
 /// recursive application or evaluating a declaration. A skipped lazy component prevents
 /// the proof; it does not justify erasing the pending operation.
-fn structurally_static<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
+pub(super) fn structurally_static<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
     struct StaticVisitor<'a, 'db> {
         env: &'a ProgramEnvironment<'db>,
         seen: RefCell<FxHashSet<Type<'db>>>,
@@ -1670,8 +1751,8 @@ fn stored_variables<'db>(
                     let mut capture = capture;
                     for operation in recursive.operations(db) {
                         operation.with_mapping(|mapping| {
-                            let mut operation_visitor =
-                                ApplyTypeMappingVisitor::new_for_type_construction(env);
+                            let mut operation_visitor = ApplyTypeMappingVisitor::new(env)
+                                .with_normalization(TypeNormalization::Structural);
                             if let RecursiveOperation::Materialize(_, map_bounds) = operation {
                                 operation_visitor.materialize_typevar_bounds_and_defaults =
                                     *map_bounds;

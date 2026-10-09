@@ -7,7 +7,6 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::iter;
-use std::rc::Rc;
 use std::time::Duration;
 
 use bitflags::bitflags;
@@ -143,6 +142,8 @@ mod context;
 mod context_manager;
 mod cyclic;
 mod dedicated;
+mod deferred;
+pub use deferred::DeferredType;
 mod diagnostic;
 mod dict;
 mod display;
@@ -164,6 +165,7 @@ mod mro;
 pub(crate) mod narrow;
 mod newtype;
 mod overrides;
+mod projection;
 mod protocol_class;
 mod recursive;
 pub(crate) use recursive::RecursiveMapping;
@@ -501,10 +503,28 @@ impl MetaTypeRecursion<'_> {
 }
 
 struct ApplyTypeMappingTag;
-struct ApplyMaterializationEquivalence;
 
-type MaterializationEquivalenceVisitor<'db> =
-    Rc<CycleDetector<'db, ApplyMaterializationEquivalence, (Type<'db>, Type<'db>), bool, 1>>;
+/// A call-construction continuation retains its input expression and recursive proof context.
+struct CallObservation<'db> {
+    operand: projection::ObservedType<'db>,
+    context: relation::RelationContext<'db>,
+}
+
+impl<'db> CallObservation<'db> {
+    fn derived(&self, ty: Type<'db>) -> Self {
+        Self {
+            operand: self.operand.unchanged_or_unresolved(ty),
+            context: self.context.clone(),
+        }
+    }
+
+    fn with_operand(&self, operand: projection::ObservedType<'db>) -> Self {
+        Self {
+            operand,
+            context: self.context.clone(),
+        }
+    }
+}
 
 /// A [`TypeTransformer`] that is used in `apply_type_mapping` methods.
 ///
@@ -524,7 +544,6 @@ pub(crate) struct ApplyTypeMappingVisitor<'env, 'db> {
     bottom_specialization_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     skip_promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
-    materialization_equivalence: OnceCell<MaterializationEquivalenceVisitor<'db>>,
 }
 
 impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
@@ -541,7 +560,6 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             bottom_specialization_materialization: OnceCell::default(),
             promotion: OnceCell::default(),
             skip_promotion: OnceCell::default(),
-            materialization_equivalence: OnceCell::default(),
         }
     }
 
@@ -567,11 +585,6 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             Some(context) => ty.to_meta_type_with_recursion(db, self.env, context),
             None => ty.to_meta_type(db, self.env),
         }
-    }
-
-    fn materialization_equivalence(&self) -> &MaterializationEquivalenceVisitor<'db> {
-        self.materialization_equivalence
-            .get_or_init(|| Rc::new(CycleDetector::new(true)))
     }
 
     fn visit(
@@ -601,32 +614,17 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             .visit_type(db, ty, func)
     }
 
-    fn is_equivalent_to_materialization(
-        &self,
-        db: &'db dyn Db,
-        left: Type<'db>,
-        right: Type<'db>,
-    ) -> bool {
-        self.materialization_equivalence()
-            .visit(db, (left, right), || {
-                left.is_equivalent_to_with_materialization_visitor(db, right, self)
-            })
-    }
-
+    /// Start a distinct mapping with fresh caches while preserving the observation context.
+    /// Cached type results cannot be shared between different specialization bindings.
     fn for_new_mapping(&self) -> Self {
-        let materialization_equivalence = OnceCell::new();
-        let was_empty =
-            materialization_equivalence.set(Rc::clone(self.materialization_equivalence()));
-        debug_assert!(was_empty.is_ok());
-
         Self {
-            materialization_equivalence,
             recursion_context: self.recursion_context,
             normalization: self.normalization,
             materialize_typevar_bounds_and_defaults: self.materialize_typevar_bounds_and_defaults,
             ..Self::new(self.env)
         }
     }
+
     /// Fork a structural substitution while retaining the current observation's origins.
     /// A constructor must not inherit semantic normalization from its caller: simplifying
     /// a complement or union can otherwise unfold a growing reference before it is observed.
@@ -2009,6 +2007,8 @@ pub enum Type<'db> {
     /// A recursive type whose references are bound by its body.
     /// See the module documentation in `recursive.rs` for details.
     Recursive(RecursiveType<'db>),
+    /// A closed type operation whose interpretation requires a proof context.
+    Deferred(DeferredType<'db>),
     /// A variable in a recursive type body, with no standalone type semantics.
     ///
     /// This is syntax, not a dynamic type or an inference variable. It must remain
@@ -2133,14 +2133,6 @@ impl<'db> DiscardDisjointUnionElementsResult<'db> {
         match self {
             Self::Retained(ty) => ty,
             Self::AllDisjoint => Type::Never,
-        }
-    }
-
-    /// Returns the retained type, or `original` if every union element was disjoint.
-    fn unless_all_disjoint(self, original: Type<'db>) -> Type<'db> {
-        match self {
-            Self::Retained(ty) => ty,
-            Self::AllDisjoint => original,
         }
     }
 }
@@ -3320,6 +3312,7 @@ impl<'db> Type<'db> {
             | Type::NominalInstance(_)
             | Type::ProtocolInstance(_)
             | Type::Recursive(_)
+            | Type::Deferred(_)
             | Type::ModuleLiteral(_)
             | Type::ClassLiteral(_)
             | Type::GenericAlias(_)
@@ -3380,6 +3373,7 @@ impl<'db> Type<'db> {
             Type::Intersection(_) => false,
             Type::EnumComplement(complement) => complement.is_spellable(db),
             Type::Divergent(_)
+            | Type::Deferred(_)
             | Type::SpecialForm(_)
             | Type::BoundSuper(_)
             | Type::BoundMethod(_)
@@ -3416,6 +3410,7 @@ impl<'db> Type<'db> {
             | Type::Recursive(_) => true,
 
             Type::Intersection(_)
+            | Type::Deferred(_)
             | Type::EnumComplement(_)
             | Type::Divergent(_)
             | Type::SpecialForm(_)
@@ -3522,10 +3517,11 @@ impl<'db> Type<'db> {
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
+        parent_constraints: &ConstraintSetBuilder<'db>,
         target: Type<'db>,
         inferable: TypeVarSet<'db>,
     ) -> DiscardDisjointUnionElementsResult<'db> {
-        let constraints = ConstraintSetBuilder::new();
+        let constraints = parent_constraints.child();
         let filtered = self.filter_union(db, env, |elem| {
             !elem
                 .when_disjoint_from(db, env, target, &constraints, inferable)
@@ -3800,7 +3796,11 @@ impl<'db> Type<'db> {
         if nested
             && matches!(
                 self,
-                Type::TypeAlias(_) | Type::Recursive(_) | Type::TypedDict(_) | Type::TypeVar(_)
+                Type::TypeAlias(_)
+                    | Type::Recursive(_)
+                    | Type::Deferred(_)
+                    | Type::TypedDict(_)
+                    | Type::TypeVar(_)
             )
             && any_over_type_including_alias_arguments(db, env, self, |ty| {
                 ty.is_pending_narrowing()
@@ -3876,7 +3876,7 @@ impl<'db> Type<'db> {
             Type::TypedDict(typed_dict) => typed_dict
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::TypedDict),
-            Type::TypeAlias(_) => Some(self),
+            Type::TypeAlias(_) | Type::Deferred(_) => Some(self),
             Type::NewTypeInstance(newtype) => newtype
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::NewTypeInstance),
@@ -3990,7 +3990,7 @@ impl<'db> Type<'db> {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
-            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => false,
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Deferred(_) | Type::Never => false,
             Type::Recursive(recursive) => recursive
                 .unfold(db, env)
                 .is_unfolded_and(|unfolded| unfolded.is_singleton(db, env)),
@@ -4129,6 +4129,9 @@ impl<'db> Type<'db> {
         }
 
         match self {
+            Type::Deferred(deferred) => deferred
+                .try_resolve(db, env)
+                .and_then(|ty| ty.find_name_in_mro_with_policy(db, env, name, policy)),
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
@@ -4734,6 +4737,10 @@ impl<'db> Type<'db> {
         name: &str,
     ) -> PlaceAndQualifiers<'db> {
         match self {
+            Type::Deferred(deferred) => deferred
+                .try_resolve(db, env)
+                .map(|ty| ty.instance_member(db, env, name))
+                .unwrap_or_default(),
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
@@ -5966,6 +5973,14 @@ impl<'db> Type<'db> {
             }
 
             match this {
+                Type::Deferred(deferred) => deferred
+                    .try_resolve(db, env)
+                    .map(|ty| {
+                        ty.member_lookup_with_policy_and_receiver(
+                            db, env, name_str, policy, receiver,
+                        )
+                    })
+                    .unwrap_or(Place::bound(Type::unknown()).into()),
                 Type::Recursive(recursive)
                     if recursive.materialization_kind(db).is_none()
                         && let Some(protocol) = this.as_protocol_instance(db) =>
@@ -6859,7 +6874,30 @@ impl<'db> Type<'db> {
     /// elements. It's usually best to only worry about "callability" relative to a particular
     /// argument list, via [`try_call`][Self::try_call] and [`CallErrorKind::NotCallable`].
     fn bindings(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Bindings<'db> {
-        self.bindings_impl(db, env, &ActiveRecursionDetector::default())
+        Self::bindings_observed(
+            db,
+            env,
+            projection::ObservedType::root(self),
+            relation::RelationContext::default(),
+        )
+    }
+
+    /// Begin call analysis from an existing expression observation.
+    fn bindings_observed(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        observed: projection::ObservedType<'db>,
+        context: relation::RelationContext<'db>,
+    ) -> Bindings<'db> {
+        let proof = CallObservation {
+            operand: observed,
+            context,
+        };
+        proof
+            .operand
+            .ty
+            .bindings_impl(db, env, &ActiveRecursionDetector::default(), &proof)
+            .with_observed_callable(db, env, &proof.operand)
     }
 
     fn bindings_impl(
@@ -6867,8 +6905,9 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         recursion_guard: &ActiveRecursionDetector<Type<'db>>,
+        proof: &CallObservation<'db>,
     ) -> Bindings<'db> {
-        self.bindings_with_receiver(db, env, recursion_guard, None)
+        self.bindings_with_receiver(db, env, recursion_guard, None, proof)
     }
 
     fn bindings_with_receiver(
@@ -6877,15 +6916,52 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         recursion_guard: &ActiveRecursionDetector<Type<'db>>,
         receiver: Option<Type<'db>>,
+        proof: &CallObservation<'db>,
+    ) -> Bindings<'db> {
+        let proof = proof.derived(self);
+        proof
+            .context
+            .bind_call(db, &proof.operand, || {
+                Some(self.bindings_with_receiver_impl(db, env, recursion_guard, receiver, &proof))
+            })
+            .unwrap_or_else(|| {
+                if recursion_guard.is_empty() {
+                    CallableBinding::not_callable(self).into()
+                } else {
+                    // Constructor cycles can pass through descriptors or callable instances.
+                    // Keep the same recovery regardless of where the cycle closes: the enclosing
+                    // constructor supplies its instance result while the parameters are unknown.
+                    Binding::single(self, Signature::dynamic(Type::unknown())).into()
+                }
+            })
+    }
+
+    fn bindings_with_receiver_impl(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        recursion_guard: &ActiveRecursionDetector<Type<'db>>,
+        receiver: Option<Type<'db>>,
+        proof: &CallObservation<'db>,
     ) -> Bindings<'db> {
         if let Some(fallback) = self.materialized_divergent_fallback() {
-            return fallback.bindings_with_receiver(db, env, recursion_guard, receiver);
+            return fallback.bindings_with_receiver(db, env, recursion_guard, receiver, proof);
         }
 
         match self {
-            Type::Recursive(recursive) => recursive
-                .unfold(db, env)
-                .map(|unfolded| unfolded.bindings_with_receiver(db, env, recursion_guard, receiver))
+            Type::Recursive(_) | Type::TypeAlias(_) | Type::Deferred(_) => proof
+                .operand
+                .unfold_in_context(db, env, &proof.context)
+                .map(|unfolded| {
+                    let child = proof.with_operand(unfolded);
+                    child.operand.ty.bindings_with_receiver(
+                        db,
+                        env,
+                        recursion_guard,
+                        receiver,
+                        &child,
+                    )
+                })
                 .unwrap_or_else(|| CallableBinding::not_callable(self).into()),
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
@@ -6898,12 +6974,12 @@ impl<'db> Type<'db> {
             Type::TypeVar(bound_typevar) => {
                 match bound_typevar.require_bound_or_constraints(db, env) {
                     TypeVarBoundOrConstraints::UpperBound(bound) => {
-                        bound.bindings_with_receiver(db, env, recursion_guard, receiver)
+                        bound.bindings_with_receiver(db, env, recursion_guard, receiver, proof)
                     }
                     TypeVarBoundOrConstraints::Constraints(constraints) => Bindings::from_union(
                         self,
                         constraints.elements(db).iter().map(|ty| {
-                            ty.bindings_with_receiver(db, env, recursion_guard, receiver)
+                            ty.bindings_with_receiver(db, env, recursion_guard, receiver, proof)
                         }),
                     ),
                 }
@@ -6959,20 +7035,37 @@ impl<'db> Type<'db> {
                 } else {
                     // Solve exact receiver constraints before checking the other arguments, but
                     // retain the receiver itself for call inference and receiver diagnostics.
-                    let overloads = signature.overloads.iter().flat_map(|overload| {
-                        if overload.has_receiver_determined_method_typevar(db, env)
-                            && let Some(specialized) = overload.specialize_for_bound_receiver(
-                                db,
-                                env,
-                                self_instance,
-                                bound_method.typing_self_type(db),
-                            )
-                        {
-                            specialized.overloads
-                        } else {
-                            smallvec_inline![overload.clone()]
-                        }
-                    });
+                    let callable = Type::Callable(CallableType::new(
+                        db,
+                        signature.clone(),
+                        callable::CallableTypeKind::Regular,
+                    ));
+                    let observed = proof.operand.unchanged_or_unresolved(callable);
+                    let overloads =
+                        signature
+                            .overloads
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(index, overload)| {
+                                let observed = observed
+                                    .callable_overload(db, env, index)
+                                    .unwrap_or_else(|| observed.unresolved());
+                                if overload.has_receiver_determined_method_typevar(db, env)
+                                    && let Some(specialized) = overload
+                                        .specialize_for_bound_receiver(
+                                            db,
+                                            env,
+                                            self_instance,
+                                            bound_method.typing_self_type(db),
+                                            &proof.context,
+                                            &observed,
+                                        )
+                                {
+                                    specialized.overloads
+                                } else {
+                                    smallvec_inline![overload.clone()]
+                                }
+                            });
 
                     CallableBinding::from_overloads(self, overloads)
                         .with_bound_type(self_instance)
@@ -6983,7 +7076,7 @@ impl<'db> Type<'db> {
             // Keep the receiver constraints and known-function handling of a direct call.
             Type::KnownBoundMethod(KnownBoundMethodType::DunderCall(callable)) => callable
                 .inner(db)
-                .bindings_impl(db, env, recursion_guard)
+                .bindings_impl(db, env, recursion_guard, proof)
                 .with_callable_type(self),
             Type::KnownBoundMethod(method) => method.callables(db, env).map_or_else(
                 || CallableBinding::not_callable(self).into(),
@@ -7170,24 +7263,30 @@ impl<'db> Type<'db> {
                         env,
                         ClassType::NonGeneric(class),
                         recursion_guard,
+                        proof,
                     )
                 }),
 
-            Type::GenericAlias(alias) => {
-                self.constructor_bindings(db, env, ClassType::Generic(alias), recursion_guard)
-            }
+            Type::GenericAlias(alias) => self.constructor_bindings(
+                db,
+                env,
+                ClassType::Generic(alias),
+                recursion_guard,
+                proof,
+            ),
 
             Type::SubclassOf(subclass_of_type) => match subclass_of_type.subclass_of() {
                 SubclassOfInner::Dynamic(dynamic_type) => {
                     Binding::single(self, Signature::dynamic(Type::Dynamic(dynamic_type))).into()
                 }
                 SubclassOfInner::Class(class) => {
-                    self.constructor_bindings(db, env, class, recursion_guard)
+                    self.constructor_bindings(db, env, class, recursion_guard, proof)
                 }
                 SubclassOfInner::Protocol(protocol) => protocol.class_origin(db).map_or_else(
                     || Binding::single(self, Signature::dynamic(Type::unknown())).into(),
                     |origin| {
-                        let bindings = self.constructor_bindings(db, env, *origin, recursion_guard);
+                        let bindings =
+                            self.constructor_bindings(db, env, *origin, recursion_guard, proof);
                         if protocol.materialization_kind(db).is_some() {
                             bindings.with_constructed_instance_type(
                                 db,
@@ -7209,15 +7308,19 @@ impl<'db> Type<'db> {
                             {
                                 bindings
                             } else {
-                                constructor.bindings_impl(db, env, recursion_guard)
+                                constructor.bindings_impl(db, env, recursion_guard, proof)
                             }
                         }
                         TypeVarBoundOrConstraints::Constraints(constraints) => {
                             Bindings::from_union(
                                 self,
                                 constraints.elements(db).iter().map(|ty| {
-                                    ty.to_meta_type(db, env)
-                                        .bindings_impl(db, env, recursion_guard)
+                                    ty.to_meta_type(db, env).bindings_impl(
+                                        db,
+                                        env,
+                                        recursion_guard,
+                                        proof,
+                                    )
                                 }),
                             )
                         }
@@ -7265,7 +7368,8 @@ impl<'db> Type<'db> {
                         definedness: boundness,
                         ..
                     }) => {
-                        let mut bindings = dunder_callable.bindings_impl(db, env, recursion_guard);
+                        let mut bindings =
+                            dunder_callable.bindings_impl(db, env, recursion_guard, proof);
                         bindings.replace_callable_type(dunder_callable, self);
                         bindings.set_implicitly_invoked();
                         if boundness == Definedness::PossiblyUndefined {
@@ -7287,7 +7391,7 @@ impl<'db> Type<'db> {
             Type::Union(union) => Bindings::from_union(
                 self,
                 union.elements(db).iter().map(|element| {
-                    element.bindings_with_receiver(db, env, recursion_guard, receiver)
+                    element.bindings_with_receiver(db, env, recursion_guard, receiver, proof)
                 }),
             ),
 
@@ -7312,6 +7416,7 @@ impl<'db> Type<'db> {
                             db,
                             env,
                             recursion_guard,
+                            proof,
                         );
                         bindings.has_only_constructor_items().then_some(bindings)
                     } =>
@@ -7331,6 +7436,7 @@ impl<'db> Type<'db> {
                         env,
                         recursion_guard,
                         Some(receiver.unwrap_or(self)),
+                        proof,
                     )
                 }),
             ),
@@ -7338,7 +7444,7 @@ impl<'db> Type<'db> {
             Type::EnumComplement(complement) => {
                 complement
                     .to_intersection(db, env)
-                    .bindings_impl(db, env, recursion_guard)
+                    .bindings_impl(db, env, recursion_guard, proof)
             }
 
             Type::DataclassDecorator(_) => {
@@ -7370,7 +7476,7 @@ impl<'db> Type<'db> {
             Type::LiteralValue(literal) => match literal.kind() {
                 LiteralValueTypeKind::Enum(enum_literal) => enum_literal
                     .enum_class_instance(db, env)
-                    .bindings_impl(db, env, recursion_guard),
+                    .bindings_impl(db, env, recursion_guard, proof),
                 _ => CallableBinding::not_callable(self).into(),
             },
 
@@ -7387,7 +7493,7 @@ impl<'db> Type<'db> {
             Type::KnownInstance(
                 KnownInstanceType::FunctoolsPartial(partial)
                 | KnownInstanceType::FunctoolsPartialCall(partial),
-            ) => Type::Callable(partial.partial(db)).bindings_impl(db, env, recursion_guard),
+            ) => Type::Callable(partial.partial(db)).bindings_impl(db, env, recursion_guard, proof),
 
             Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)) => {
                 wrapper.callables(db, env).map_or_else(
@@ -7395,20 +7501,14 @@ impl<'db> Type<'db> {
                     |callables| {
                         callables
                             .to_type(db, env)
-                            .bindings_impl(db, env, recursion_guard)
+                            .bindings_impl(db, env, recursion_guard, proof)
                     },
                 )
             }
 
             Type::KnownInstance(known_instance) => known_instance
                 .instance_fallback(db, env)
-                .bindings_impl(db, env, recursion_guard),
-
-            Type::TypeAlias(alias) => {
-                alias
-                    .value_type(db)
-                    .bindings_with_receiver(db, env, recursion_guard, receiver)
-            }
+                .bindings_impl(db, env, recursion_guard, proof),
 
             Type::PropertyInstance(_)
             | Type::SlotDescriptor(_)
@@ -7793,6 +7893,7 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         class: ClassType<'db>,
         recursion_guard: &ActiveRecursionDetector<Type<'db>>,
+        proof: &CallObservation<'db>,
     ) -> Bindings<'db> {
         fn bind_constructor_new<'db>(
             db: &'db dyn Db,
@@ -7952,7 +8053,7 @@ impl<'db> Type<'db> {
                     ..
                 }) = self_type.resolve_dunder_new_callable(db, env, method.place)
             {
-                let bindings = new_callable.bindings_impl(db, env, recursion_guard);
+                let bindings = new_callable.bindings_impl(db, env, recursion_guard, proof);
                 let mut bindings =
                     bind_constructor_new(db, env, bindings, self_type, constructor_instance_ty)
                         .into_constructor_bindings(
@@ -7979,7 +8080,7 @@ impl<'db> Type<'db> {
                     _,
                 ) => {
                     let mut bindings = init_method
-                        .bindings_impl(db, env, recursion_guard)
+                        .bindings_impl(db, env, recursion_guard, proof)
                         .into_constructor_bindings(
                             constructor_instance_ty,
                             ConstructorCallableKind::Init,
@@ -8005,7 +8106,7 @@ impl<'db> Type<'db> {
                             ..
                         }) => {
                             let mut bindings = init_method
-                                .bindings_impl(db, env, recursion_guard)
+                                .bindings_impl(db, env, recursion_guard, proof)
                                 .into_constructor_bindings(
                                     constructor_instance_ty,
                                     ConstructorCallableKind::Init,
@@ -8067,7 +8168,7 @@ impl<'db> Type<'db> {
             }) = metaclass_dunder_call.place
             {
                 let mut metaclass_bindings = metaclass_call_method
-                    .bindings_impl(db, env, recursion_guard)
+                    .bindings_impl(db, env, recursion_guard, proof)
                     .into_constructor_bindings(
                         constructor_instance_ty,
                         ConstructorCallableKind::MetaclassCall,
@@ -8731,6 +8832,9 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
     ) -> Option<InstanceProjection<Type<'db>>> {
         match self {
+            Type::Deferred(deferred) => deferred
+                .try_resolve(db, env)
+                .and_then(|ty| ty.to_instance(db, env)),
             Type::Recursive(recursive) => recursive
                 .unfold(db, env)
                 .map(|unfolded| unfolded.to_instance(db, env))
@@ -8834,6 +8938,17 @@ impl<'db> Type<'db> {
     ) -> Result<Type<'db>, InvalidTypeExpressionError<'db>> {
         let env = &ProgramEnvironment::from_scope(scope_id);
         match self {
+            Type::Deferred(deferred) => deferred
+                .try_resolve(db, env)
+                .map(|ty| {
+                    ty.in_type_expression_impl(
+                        db,
+                        scope_id,
+                        typevar_binding_context,
+                        inference_flags,
+                    )
+                })
+                .unwrap_or(Ok(*self)),
             Type::Recursive(recursive) => recursive
                 .unfold(db, env)
                 .map(|unfolded| {
@@ -9123,6 +9238,10 @@ impl<'db> Type<'db> {
             visitor: &ActiveRecursionDetector<TypeAliasType<'db>>,
         ) -> Type<'db> {
             match ty {
+                Type::Deferred(deferred) => deferred
+                    .try_resolve(db, env)
+                    .map(|ty| to_meta_type_inner(db, env, ty, context, visitor))
+                    .unwrap_or_else(|| Type::unknown().to_meta_type(db, env)),
                 Type::Recursive(recursive)
                     if let Some(protocol) = ProtocolInstanceType::from_recursive(db, recursive) =>
                 {
@@ -9649,7 +9768,8 @@ impl<'db> Type<'db> {
                 // the expansion to avoid exponential blowup.
                 const MAX_PARAMSPEC_EXPANSION: usize = 64;
 
-                let mut expanded_callables = UnionBuilder::new(db, visitor.env);
+                let mut expanded_callables =
+                    UnionBuilder::new(db, visitor.env).normalization(visitor.normalization);
                 let mut expansion_size = 1usize;
                 for (_, union) in &union_paramspecs {
                     expansion_size = expansion_size.saturating_mul(union.elements(db).len());
@@ -9692,7 +9812,12 @@ impl<'db> Type<'db> {
 
                         // Use a fresh visitor, as the visitor cache does not distinguish
                         // between these specialization bindings.
-                        let callable = self.apply_type_mapping(db, visitor.env, &mapping, tcx);
+                        let callable = self.apply_type_mapping_impl(
+                            db,
+                            &mapping,
+                            tcx,
+                            &visitor.for_new_mapping(),
+                        );
                         expanded_callables.add_in_place(callable);
                     }
 
@@ -9711,6 +9836,9 @@ impl<'db> Type<'db> {
 
             Type::Recursive(recursive) => {
                 recursive.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
+            }
+            Type::Deferred(deferred) => {
+                deferred.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
             }
             Type::RecursiveVar(reference) => {
                 reference.apply_type_mapping_impl(db, type_mapping, visitor)
@@ -10054,6 +10182,12 @@ impl<'db> Type<'db> {
                 }
             }
             Type::Divergent(_) => {}
+
+            Type::Deferred(deferred) => visitor.visit(db, self, || {
+                for captured in deferred.captured_types(db, env) {
+                    captured.find_legacy_typevars_impl(db, env, binding_context, typevars, visitor);
+                }
+            }),
 
             Type::Recursive(recursive) => visitor.visit(db, self, || {
                 // A parameter can occur only in recursive arguments, so unfolding the body
@@ -10497,6 +10631,9 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
     ) -> Option<TypeDefinition<'db>> {
         match self {
+            Type::Deferred(deferred) => deferred
+                .try_resolve(db, env)
+                .and_then(|ty| ty.definition(db, env)),
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
@@ -10999,6 +11136,7 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
             }
             Type::ClassLiteral(class_literal) => class_literal.variance_of(db, env, typevar),
             Type::Recursive(recursive) => recursive.variance_of(db, env, typevar),
+            Type::Deferred(deferred) => deferred.variance_of(db, env, typevar),
 
             Type::FunctionLiteral(function_type) => {
                 // TODO: do we need to replace self?
@@ -11126,7 +11264,7 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub enum PromotionMode {
     On,
     Off,
@@ -11141,7 +11279,7 @@ impl PromotionMode {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, get_size2::GetSize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub enum PromotionKind {
     /// Default promotion behaviour: recurse into nested types
     Regular,
